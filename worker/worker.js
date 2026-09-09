@@ -817,6 +817,22 @@ const CSS = `
   .seg + .seg { margin-left:0; }
   .seg button:last-child, .seg a:last-child { border-right:0; }
   .seg button.on, .seg a.on { background:#f4f4f4; color:#1a1a1a; font-weight:600; }
+  /* Logged-item search (Owner 9/9): the button expands an input rightward;
+     results are quiet rows, days on the left / item on the right, in the
+     page's own type. */
+  .srch { display:inline-flex; align-items:center; gap:6px; }
+  .srch > button { font:inherit; font-size:12px; line-height:1; padding:6px 11px; border:1px solid #e4e4e4; border-radius:6px; background:#fff; color:#797979; cursor:pointer; }
+  .srch > button.on { background:#f4f4f4; color:#1a1a1a; font-weight:600; }
+  .srch input { font:inherit; font-size:12px; line-height:1; color:#1a1a1a; background:#fff; border:1px solid #e4e4e4; border-radius:6px; width:0; min-width:0; padding:6px 0; border-width:0; opacity:0; transition:width .18s ease, opacity .18s ease; }
+  .srch.on input { width:170px; padding:6px 8px; border-width:1px; opacity:1; }
+  .srch .seg { display:none; margin-left:0; }
+  .srch.on .seg { display:inline-flex; }
+  .srchres { margin:10px 0 0; border-top:1px solid #e4e4e4; max-height:180px; overflow-y:auto; font-size:12px; }
+  .srchres .sr { display:flex; align-items:baseline; gap:12px; padding:6px 0; border-bottom:1px solid #f0f0f0; }
+  .srchres .sr:last-child { border-bottom:0; }
+  .srchres .sr .days { flex:0 0 auto; color:#797979; }
+  .srchres .sr .nm { flex:1 1 auto; min-width:0; color:#1a1a1a; }
+  .srchres .srempty { padding:8px 0; color:#797979; }
   /* Owner 8/15: the Line/Opaque toggle sits centered in the gap between the
      split tabs and the date-range seg, not pinned to the far right. */
   .legend { display:flex; align-items:center; flex-wrap:wrap; gap:9px 22px; margin:14px 0 14px; }
@@ -1085,6 +1101,9 @@ const CSS = `
     .legend .item { font-size:11px; gap:6px; }
     .legend .x { margin-left:0; padding:6px; margin:-6px -6px -6px 0; font-size:13px; }
     .cust input, .cust select { padding:7px 8px; }
+    .srch { order:9; flex:1 1 100%; flex-wrap:wrap; }
+    .srch.on input { flex:1 1 auto; width:auto; }
+    .srchres { max-height:150px; }
     .cust select { padding-right:22px; }
     .card + .card { margin-top:18px; padding-top:16px; }
   }
@@ -4158,6 +4177,73 @@ document.querySelector('#mmode [data-m="raw"]').classList.add('on');
 document.querySelector('#mseg [data-w="7"]').classList.add('on');
 render(7);
 
+/* ---------------- Logged-item search (Owner 9/9) ---------------- */
+// "search for specific food items using a simple regex that matches the exact
+// search term in logged items": the typed text IS the pattern (an invalid
+// pattern falls back to a literal match), tested against each logged item's
+// full title and its short display name. Results are quiet rows - days on
+// the left, item on the right - over 3 day / 7 day / All time.
+const srchBox = document.getElementById('msrch');
+const srchBtn = document.getElementById('msrchbtn');
+const srchQ = document.getElementById('msrchq');
+const srchRes = document.getElementById('msrchres');
+const srchEsc = s => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+let srchW = 7;
+function srchMatcher(q) {
+  try { return new RegExp(q, 'i'); }
+  catch (e) {
+    const bs = String.fromCharCode(92);
+    const specials = bs + '^$.*+?()[]{}|';
+    return new RegExp(q.split('').map(ch => specials.indexOf(ch) >= 0 ? bs + ch : ch).join(''), 'i');
+  }
+}
+function srchRender() {
+  const q = srchQ.value.trim();
+  if (!q || !srchBox.classList.contains('on')) { srchRes.hidden = true; srchRes.innerHTML = ''; return; }
+  const re = srchMatcher(q);
+  let cutoff = null;
+  if (srchW) {
+    const dd = new Date(); dd.setDate(dd.getDate() - (srchW - 1));
+    cutoff = dd.getFullYear() + '-' + String(dd.getMonth() + 1).padStart(2, '0') + '-' + String(dd.getDate()).padStart(2, '0');
+  }
+  const hits = {};
+  Object.keys(ITEMS).forEach(day => {
+    const list = ITEMS[day];
+    if (!Array.isArray(list)) return;
+    if (cutoff && day < cutoff) return;
+    list.forEach(it => {
+      const raw = String(it[0] || '');
+      const disp = SHORTS[raw] || raw.replace(/ \\([^)]*\\)$/, '');
+      if (!re.test(raw) && !re.test(disp)) return;
+      (hits[disp] = hits[disp] || {})[day] = 1;
+    });
+  });
+  const names = Object.keys(hits).sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
+  srchRes.hidden = false;
+  srchRes.innerHTML = names.length
+    ? names.map(nm => {
+        const all = Object.keys(hits[nm]).sort().reverse();
+        const shown = all.length > 6 ? all.slice(0, 5).map(fmt).join(', ') + ' +' + (all.length - 5) + ' more' : all.map(fmt).join(', ');
+        return '<div class="sr"><span class="days">' + shown + '</span><span class="nm">' + srchEsc(nm) + '</span></div>';
+      }).join('')
+    : '<div class="srempty">No logged items match.</div>';
+}
+srchBtn.addEventListener('click', () => {
+  const open = srchBox.classList.toggle('on');
+  srchBtn.classList.toggle('on', open);
+  if (open) srchQ.focus();
+  srchRender();
+});
+srchQ.addEventListener('input', srchRender);
+srchQ.addEventListener('keydown', e => { if (e.key === 'Escape') { srchQ.value = ''; srchQ.blur(); srchRender(); } });
+document.querySelectorAll('#msrchseg button').forEach(b => b.addEventListener('click', () => {
+  document.querySelectorAll('#msrchseg button').forEach(x => x.classList.remove('on'));
+  b.classList.add('on');
+  srchW = Number(b.dataset.sw);
+  srchRender();
+}));
+document.querySelector('#msrchseg [data-sw="7"]').classList.add('on');
+
 /* ---------------- Workout ---------------- */
 
 // Weights come from the derived "<Exercise> (wt)" columns in Notion, computed by
@@ -5253,6 +5339,7 @@ async function poll() {
       const short = ITEMS.__short;
       ITEMS = j.items; if (short) ITEMS.__short = short;
       render(currentW);
+      srchRender();
     }
   } catch (e) {}
   try {
@@ -5601,7 +5688,15 @@ function chartPage(rows, meta, wk, token, ek, goals, hsnap, items) {
     <span class="seg" id="mseg">
       <button data-w="3">3 day</button><button data-w="7">7 day</button><button data-w="0">All time</button><button data-avg="1">Average</button>
     </span>
+    <span class="srch" id="msrch">
+      <button id="msrchbtn" type="button" aria-label="Search logged items">Search</button>
+      <input id="msrchq" type="text" placeholder="search logged items" autocomplete="off" spellcheck="false">
+      <span class="seg" id="msrchseg">
+        <button data-sw="3">3 day</button><button data-sw="7">7 day</button><button data-sw="0">All time</button>
+      </span>
+    </span>
   </div>
+  <div class="srchres" id="msrchres" hidden></div>
   <div class="legend" id="mlegend"></div>
   <div class="wrap"><div id="c" class="svghost"></div></div>
   <div class="foot" style="margin-top:8px"><a id="goalslink" href="/goals">Edit macro goals</a></div>
