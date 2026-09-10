@@ -819,14 +819,14 @@ const CSS = `
   .seg button.on, .seg a.on { background:#f4f4f4; color:#1a1a1a; font-weight:600; }
   /* Logged-item search (Owner 9/9): a bare magnifier sits in the Macros
      head; a click (or a hover on fine-pointer devices) opens the search row
-     UNDER the head, so the head's own controls never move. Results are
-     quiet rows, days on the left / item on the right, in the page's type. */
+     UNDER the head, so the head's own controls never move. The row is just
+     the input - results follow the head's selected range. Results are quiet
+     rows, days on the left / item on the right, in the page's type. */
   .sicn { display:inline-flex; align-items:center; justify-content:center; padding:5px 7px; border:1px solid #e4e4e4; border-radius:6px; background:#fff; color:#797979; cursor:pointer; }
   .sicn.on { background:#f4f4f4; color:#1a1a1a; }
   .srchrow { display:flex; align-items:center; flex-wrap:wrap; gap:6px; margin:10px 0 0; }
   .srchrow[hidden] { display:none; }
   .srchrow input { flex:0 1 220px; width:220px; min-width:120px; max-width:100%; font:inherit; font-size:12px; line-height:1; color:#1a1a1a; background:#fff; border:1px solid #e4e4e4; border-radius:6px; padding:6px 8px; }
-  .srchrow .seg { margin-left:0; flex:none; }
   .srchres { margin:10px 0 0; border-top:1px solid #e4e4e4; max-height:180px; overflow-y:auto; font-size:12px; }
   .srchres .sr { display:flex; align-items:baseline; gap:12px; padding:6px 0; border-bottom:1px solid #f0f0f0; }
   .srchres .sr:last-child { border-bottom:0; }
@@ -4166,11 +4166,13 @@ document.querySelectorAll('#mseg button').forEach(b => b.addEventListener('click
     avgOn = !avgOn;
     b.classList.toggle('on', avgOn);
     render(currentW);
+    srchRender();
     return;
   }
   document.querySelectorAll('#mseg [data-w]').forEach(x => x.classList.remove('on'));
   b.classList.add('on');
   render(Number(b.dataset.w));
+  srchRender();
 }));
 document.querySelector('#mmode [data-m="raw"]').classList.add('on');
 document.querySelector('#mseg [data-w="7"]').classList.add('on');
@@ -4181,15 +4183,16 @@ render(7);
 // search term in logged items": the typed text IS the pattern (an invalid
 // pattern falls back to a literal match), tested against each logged item's
 // full title and its short display name. Results are quiet rows - days on
-// the left, item on the right - over 3 day / 7 day / All time. Per the 9/9
-// follow-up the head holds only a magnifier icon; the search itself lives in
-// a row under the head ("the other icons at the top should not be touched").
+// the left, item on the right - over the head's selected range (9/9: no
+// separate range picker in the search row - "why does this spawn a random,
+// addition 3/7/all time thing"). Per the 9/9 follow-up the head holds only a
+// magnifier icon; the search itself lives in a row under the head ("the
+// other icons at the top should not be touched").
 const srchBtn = document.getElementById('msrchbtn');
 const srchRow = document.getElementById('msrchrow');
 const srchQ = document.getElementById('msrchq');
 const srchRes = document.getElementById('msrchres');
 const srchEsc = s => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-let srchW = 7;
 // Open state: pinned by a click, held open by a fine-pointer hover over the
 // icon or row, by focus in the field, or by a non-empty query. Hover opens
 // are transient - leave with an empty, unfocused field and it closes.
@@ -4226,8 +4229,8 @@ function srchRender() {
   if (!q || srchRow.hidden) { srchRes.hidden = true; srchRes.innerHTML = ''; return; }
   const re = srchMatcher(q);
   let cutoff = null;
-  if (srchW) {
-    const dd = new Date(); dd.setDate(dd.getDate() - (srchW - 1));
+  if (currentW) {
+    const dd = new Date(); dd.setDate(dd.getDate() - (currentW - 1));
     cutoff = dd.getFullYear() + '-' + String(dd.getMonth() + 1).padStart(2, '0') + '-' + String(dd.getDate()).padStart(2, '0');
   }
   const hits = {};
@@ -4264,14 +4267,6 @@ srchRow.addEventListener('mouseleave', srchQueueClose);
 srchQ.addEventListener('input', srchRender);
 srchQ.addEventListener('blur', srchQueueClose);
 srchQ.addEventListener('keydown', e => { if (e.key === 'Escape') { srchPinned = false; srchQ.value = ''; srchQ.blur(); srchApply(); } });
-document.querySelectorAll('#msrchseg button').forEach(b => b.addEventListener('click', () => {
-  document.querySelectorAll('#msrchseg button').forEach(x => x.classList.remove('on'));
-  b.classList.add('on');
-  srchW = Number(b.dataset.sw);
-  srchRender();
-}));
-document.querySelector('#msrchseg [data-sw="7"]').classList.add('on');
-
 /* ---------------- Workout ---------------- */
 
 // Weights come from the derived "<Exercise> (wt)" columns in Notion, computed by
@@ -5720,9 +5715,6 @@ function chartPage(rows, meta, wk, token, ek, goals, hsnap, items) {
   </div>
   <div class="srchrow" id="msrchrow" hidden>
     <input id="msrchq" type="text" placeholder="search" autocomplete="off" spellcheck="false">
-    <span class="seg" id="msrchseg">
-      <button data-sw="3">3 day</button><button data-sw="7">7 day</button><button data-sw="0">All time</button>
-    </span>
   </div>
   <div class="srchres" id="msrchres" hidden></div>
   <div class="legend" id="mlegend"></div>
