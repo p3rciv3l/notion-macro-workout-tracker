@@ -5719,7 +5719,7 @@ function chartPage(rows, meta, wk, token, ek, goals, hsnap, items) {
     <button class="sicn" id="msrchbtn" type="button" aria-label="Search logged items"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.8"></circle><line x1="15.6" y1="15.6" x2="21" y2="21"></line></svg></button>
   </div>
   <div class="srchrow" id="msrchrow" hidden>
-    <input id="msrchq" type="text" placeholder="search logged items" autocomplete="off" spellcheck="false">
+    <input id="msrchq" type="text" placeholder="search" autocomplete="off" spellcheck="false">
     <span class="seg" id="msrchseg">
       <button data-sw="3">3 day</button><button data-sw="7">7 day</button><button data-sw="0">All time</button>
     </span>
