@@ -5742,7 +5742,7 @@ function chartPage(rows, meta, wk, token, ek, goals, hsnap, items) {
       <button data-f="opaque">Opaque</button><button data-f="line">Line</button>
     </span>
     <span class="seg" id="wseg">
-      <button data-w="30">Month</button><button data-w="90">90 day</button><button data-w="0">All time</button><button data-w="custom">Custom</button>
+      <button data-w="30">Month</button><button data-w="90">90 day</button><button data-w="0">All</button><button data-w="custom">Custom</button>
     </span>
   </div>
   <div class="row2" id="wrow2">
