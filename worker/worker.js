@@ -818,16 +818,13 @@ const CSS = `
   .seg button:last-child, .seg a:last-child { border-right:0; }
   .seg button.on, .seg a.on { background:#f4f4f4; color:#1a1a1a; font-weight:600; }
   /* Logged-item search (Owner 9/9): a bare magnifier (no box) sits in the
-     Macros head; a click (or a hover on fine-pointer devices) opens the
-     search row
-     UNDER the head, so the head's own controls never move. The row is just
-     the input - results follow the head's selected range. Results are quiet
-     rows, days on the left / item on the right, in the page's type. */
+     Macros head; a click (or a hover on fine-pointer devices) unfolds the
+     input INTO the legend row itself - legend items reflow around it, so
+     the header never gains a row. Results follow the head's selected range
+     and are quiet rows, days on the left / item on the right. */
   .sicn { display:inline-flex; align-items:center; justify-content:center; padding:5px 4px; border:0; background:none; color:#797979; cursor:pointer; }
   .sicn:hover, .sicn.on { color:#1a1a1a; }
-  .srchrow { display:flex; align-items:center; flex-wrap:wrap; gap:6px; margin:10px 0 0; }
-  .srchrow[hidden] { display:none; }
-  .srchrow input { flex:0 1 220px; width:220px; min-width:120px; max-width:100%; font:inherit; font-size:12px; line-height:1; color:#1a1a1a; background:#fff; border:1px solid #e4e4e4; border-radius:6px; padding:6px 8px; }
+  .legend input#msrchq { flex:0 1 170px; width:170px; min-width:110px; max-width:100%; height:18px; box-sizing:border-box; margin:-3px 0; font:inherit; font-size:12px; line-height:1; color:#1a1a1a; background:#fff; border:1px solid #e4e4e4; border-radius:6px; padding:2px 8px; }
   .srchres { margin:10px 0 0; border-top:1px solid #e4e4e4; max-height:180px; overflow-y:auto; font-size:12px; }
   .srchres .sr { display:flex; align-items:baseline; gap:12px; padding:6px 0; border-bottom:1px solid #f0f0f0; }
   .srchres .sr:last-child { border-bottom:0; }
@@ -1102,7 +1099,6 @@ const CSS = `
     .legend .item { font-size:11px; gap:6px; }
     .legend .x { margin-left:0; padding:6px; margin:-6px -6px -6px 0; font-size:13px; }
     .cust input, .cust select { padding:7px 8px; }
-    .srchrow input { flex-basis:120px; }
     .srchres { max-height:150px; }
     .cust select { padding-right:22px; }
     .card + .card { margin-top:18px; padding-top:16px; }
@@ -3215,7 +3211,8 @@ document.querySelectorAll('#mgrp button').forEach(b =>
   b.addEventListener('click', () => applyGroup(b.dataset.g)));
 
 function macroLegend() {
-  drawLegend(document.getElementById('mlegend'),
+  const legEl = document.getElementById('mlegend');
+  drawLegend(legEl,
     MACROS.map(m => ({ label: m.label, color: m.color, off: !!mHidden[m.key] })),
     label => {
       const m = MACROS.find(x => x.label === label);
@@ -3224,6 +3221,10 @@ function macroLegend() {
       render(currentW);
       markGroup();
     });
+  // The search input lives in the legend row (Owner 9/9); drawLegend just
+  // wiped the row's children, so put the input back at the end.
+  const sq = document.getElementById('msrchq');
+  if (sq) legEl.appendChild(sq);
 }
 
 /* ---- Bar blow-up: clicking a bar fans it out into its item stack on a side
@@ -4186,11 +4187,10 @@ render(7);
 // full title and its short display name. Results are quiet rows - days on
 // the left, item on the right - over the head's selected range (9/9: no
 // separate range picker in the search row - "why does this spawn a random,
-// addition 3/7/all time thing"). Per the 9/9 follow-up the head holds only a
-// magnifier icon; the search itself lives in a row under the head ("the
-// other icons at the top should not be touched").
+// addition 3/7/all time thing"). Per the 9/9 follow-ups the head holds only
+// a bare magnifier, and the input unfolds INTO the legend row - legend items
+// reflow around it; the header never gains a row.
 const srchBtn = document.getElementById('msrchbtn');
-const srchRow = document.getElementById('msrchrow');
 const srchQ = document.getElementById('msrchq');
 const srchRes = document.getElementById('msrchres');
 const srchEsc = s => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -4202,7 +4202,7 @@ let srchCloseT = null;
 const srchHoverable = window.matchMedia && matchMedia('(hover:hover) and (pointer:fine)').matches;
 function srchIsOpen() {
   return srchPinned
-    || (srchHoverable && (srchBtn.matches(':hover') || srchRow.matches(':hover')))
+    || (srchHoverable && (srchBtn.matches(':hover') || srchQ.matches(':hover')))
     || document.activeElement === srchQ
     || !!srchQ.value.trim();
 }
@@ -4210,7 +4210,7 @@ function srchApply() {
   clearTimeout(srchCloseT);
   const open = srchIsOpen();
   srchBtn.classList.toggle('on', open);
-  srchRow.hidden = !open;
+  srchQ.hidden = !open;
   srchRender();
 }
 function srchQueueClose() {
@@ -4227,7 +4227,7 @@ function srchMatcher(q) {
 }
 function srchRender() {
   const q = srchQ.value.trim();
-  if (!q || srchRow.hidden) { srchRes.hidden = true; srchRes.innerHTML = ''; return; }
+  if (!q || srchQ.hidden) { srchRes.hidden = true; srchRes.innerHTML = ''; return; }
   const re = srchMatcher(q);
   let cutoff = null;
   if (currentW) {
@@ -4263,8 +4263,8 @@ srchBtn.addEventListener('click', () => {
 });
 srchBtn.addEventListener('mouseenter', srchApply);
 srchBtn.addEventListener('mouseleave', srchQueueClose);
-srchRow.addEventListener('mouseenter', srchApply);
-srchRow.addEventListener('mouseleave', srchQueueClose);
+srchQ.addEventListener('mouseenter', srchApply);
+srchQ.addEventListener('mouseleave', srchQueueClose);
 srchQ.addEventListener('input', srchRender);
 srchQ.addEventListener('blur', srchQueueClose);
 srchQ.addEventListener('keydown', e => { if (e.key === 'Escape') { srchPinned = false; srchQ.value = ''; srchQ.blur(); srchApply(); } });
@@ -5714,11 +5714,8 @@ function chartPage(rows, meta, wk, token, ek, goals, hsnap, items) {
     </span>
     <button class="sicn" id="msrchbtn" type="button" aria-label="Search logged items"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.8"></circle><line x1="15.6" y1="15.6" x2="21" y2="21"></line></svg></button>
   </div>
-  <div class="srchrow" id="msrchrow" hidden>
-    <input id="msrchq" type="text" placeholder="search" autocomplete="off" spellcheck="false">
-  </div>
   <div class="srchres" id="msrchres" hidden></div>
-  <div class="legend" id="mlegend"></div>
+  <div class="legend" id="mlegend"><input id="msrchq" type="text" placeholder="search" autocomplete="off" spellcheck="false" hidden></div>
   <div class="wrap"><div id="c" class="svghost"></div></div>
   <div class="foot" style="margin-top:8px"><a id="goalslink" href="/goals">Edit macro goals</a></div>
 </div>
