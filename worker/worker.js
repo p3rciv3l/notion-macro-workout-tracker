@@ -817,16 +817,16 @@ const CSS = `
   .seg + .seg { margin-left:0; }
   .seg button:last-child, .seg a:last-child { border-right:0; }
   .seg button.on, .seg a.on { background:#f4f4f4; color:#1a1a1a; font-weight:600; }
-  /* Logged-item search (Owner 9/9): the button expands an input rightward;
-     results are quiet rows, days on the left / item on the right, in the
-     page's own type. */
-  .srch { display:inline-flex; align-items:center; gap:6px; }
-  .srch > button { font:inherit; font-size:12px; line-height:1; padding:6px 11px; border:1px solid #e4e4e4; border-radius:6px; background:#fff; color:#797979; cursor:pointer; }
-  .srch > button.on { background:#f4f4f4; color:#1a1a1a; font-weight:600; }
-  .srch input { font:inherit; font-size:12px; line-height:1; color:#1a1a1a; background:#fff; border:1px solid #e4e4e4; border-radius:6px; width:0; min-width:0; padding:6px 0; border-width:0; opacity:0; transition:width .18s ease, opacity .18s ease; }
-  .srch.on input { width:170px; padding:6px 8px; border-width:1px; opacity:1; }
-  .srch .seg { display:none; margin-left:0; }
-  .srch.on .seg { display:inline-flex; }
+  /* Logged-item search (Owner 9/9): a bare magnifier sits in the Macros
+     head; a click (or a hover on fine-pointer devices) opens the search row
+     UNDER the head, so the head's own controls never move. Results are
+     quiet rows, days on the left / item on the right, in the page's type. */
+  .sicn { display:inline-flex; align-items:center; justify-content:center; padding:5px 7px; border:1px solid #e4e4e4; border-radius:6px; background:#fff; color:#797979; cursor:pointer; }
+  .sicn.on { background:#f4f4f4; color:#1a1a1a; }
+  .srchrow { display:flex; align-items:center; flex-wrap:wrap; gap:6px; margin:10px 0 0; }
+  .srchrow[hidden] { display:none; }
+  .srchrow input { flex:0 1 220px; width:220px; min-width:120px; max-width:100%; font:inherit; font-size:12px; line-height:1; color:#1a1a1a; background:#fff; border:1px solid #e4e4e4; border-radius:6px; padding:6px 8px; }
+  .srchrow .seg { margin-left:0; flex:none; }
   .srchres { margin:10px 0 0; border-top:1px solid #e4e4e4; max-height:180px; overflow-y:auto; font-size:12px; }
   .srchres .sr { display:flex; align-items:baseline; gap:12px; padding:6px 0; border-bottom:1px solid #f0f0f0; }
   .srchres .sr:last-child { border-bottom:0; }
@@ -1101,8 +1101,7 @@ const CSS = `
     .legend .item { font-size:11px; gap:6px; }
     .legend .x { margin-left:0; padding:6px; margin:-6px -6px -6px 0; font-size:13px; }
     .cust input, .cust select { padding:7px 8px; }
-    .srch { order:9; flex:1 1 100%; flex-wrap:wrap; }
-    .srch.on input { flex:1 1 auto; width:auto; }
+    .srchrow input { flex-basis:120px; }
     .srchres { max-height:150px; }
     .cust select { padding-right:22px; }
     .card + .card { margin-top:18px; padding-top:16px; }
@@ -4182,13 +4181,38 @@ render(7);
 // search term in logged items": the typed text IS the pattern (an invalid
 // pattern falls back to a literal match), tested against each logged item's
 // full title and its short display name. Results are quiet rows - days on
-// the left, item on the right - over 3 day / 7 day / All time.
-const srchBox = document.getElementById('msrch');
+// the left, item on the right - over 3 day / 7 day / All time. Per the 9/9
+// follow-up the head holds only a magnifier icon; the search itself lives in
+// a row under the head ("the other icons at the top should not be touched").
 const srchBtn = document.getElementById('msrchbtn');
+const srchRow = document.getElementById('msrchrow');
 const srchQ = document.getElementById('msrchq');
 const srchRes = document.getElementById('msrchres');
 const srchEsc = s => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 let srchW = 7;
+// Open state: pinned by a click, held open by a fine-pointer hover over the
+// icon or row, by focus in the field, or by a non-empty query. Hover opens
+// are transient - leave with an empty, unfocused field and it closes.
+let srchPinned = false;
+let srchCloseT = null;
+const srchHoverable = window.matchMedia && matchMedia('(hover:hover) and (pointer:fine)').matches;
+function srchIsOpen() {
+  return srchPinned
+    || (srchHoverable && (srchBtn.matches(':hover') || srchRow.matches(':hover')))
+    || document.activeElement === srchQ
+    || !!srchQ.value.trim();
+}
+function srchApply() {
+  clearTimeout(srchCloseT);
+  const open = srchIsOpen();
+  srchBtn.classList.toggle('on', open);
+  srchRow.hidden = !open;
+  srchRender();
+}
+function srchQueueClose() {
+  clearTimeout(srchCloseT);
+  srchCloseT = setTimeout(srchApply, 160);
+}
 function srchMatcher(q) {
   try { return new RegExp(q, 'i'); }
   catch (e) {
@@ -4199,7 +4223,7 @@ function srchMatcher(q) {
 }
 function srchRender() {
   const q = srchQ.value.trim();
-  if (!q || !srchBox.classList.contains('on')) { srchRes.hidden = true; srchRes.innerHTML = ''; return; }
+  if (!q || srchRow.hidden) { srchRes.hidden = true; srchRes.innerHTML = ''; return; }
   const re = srchMatcher(q);
   let cutoff = null;
   if (srchW) {
@@ -4229,13 +4253,17 @@ function srchRender() {
     : '<div class="srempty">No logged items match.</div>';
 }
 srchBtn.addEventListener('click', () => {
-  const open = srchBox.classList.toggle('on');
-  srchBtn.classList.toggle('on', open);
-  if (open) srchQ.focus();
-  srchRender();
+  if (srchIsOpen()) { srchPinned = false; srchQ.value = ''; srchQ.blur(); }
+  else { srchPinned = true; srchQ.focus(); }
+  srchApply();
 });
+srchBtn.addEventListener('mouseenter', srchApply);
+srchBtn.addEventListener('mouseleave', srchQueueClose);
+srchRow.addEventListener('mouseenter', srchApply);
+srchRow.addEventListener('mouseleave', srchQueueClose);
 srchQ.addEventListener('input', srchRender);
-srchQ.addEventListener('keydown', e => { if (e.key === 'Escape') { srchQ.value = ''; srchQ.blur(); srchRender(); } });
+srchQ.addEventListener('blur', srchQueueClose);
+srchQ.addEventListener('keydown', e => { if (e.key === 'Escape') { srchPinned = false; srchQ.value = ''; srchQ.blur(); srchApply(); } });
 document.querySelectorAll('#msrchseg button').forEach(b => b.addEventListener('click', () => {
   document.querySelectorAll('#msrchseg button').forEach(x => x.classList.remove('on'));
   b.classList.add('on');
@@ -5688,12 +5716,12 @@ function chartPage(rows, meta, wk, token, ek, goals, hsnap, items) {
     <span class="seg" id="mseg">
       <button data-w="3">3 day</button><button data-w="7">7 day</button><button data-w="0">All time</button><button data-avg="1">Average</button>
     </span>
-    <span class="srch" id="msrch">
-      <button id="msrchbtn" type="button" aria-label="Search logged items">Search</button>
-      <input id="msrchq" type="text" placeholder="search logged items" autocomplete="off" spellcheck="false">
-      <span class="seg" id="msrchseg">
-        <button data-sw="3">3 day</button><button data-sw="7">7 day</button><button data-sw="0">All time</button>
-      </span>
+    <button class="sicn" id="msrchbtn" type="button" aria-label="Search logged items"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.8"></circle><line x1="15.6" y1="15.6" x2="21" y2="21"></line></svg></button>
+  </div>
+  <div class="srchrow" id="msrchrow" hidden>
+    <input id="msrchq" type="text" placeholder="search logged items" autocomplete="off" spellcheck="false">
+    <span class="seg" id="msrchseg">
+      <button data-sw="3">3 day</button><button data-sw="7">7 day</button><button data-sw="0">All time</button>
     </span>
   </div>
   <div class="srchres" id="msrchres" hidden></div>

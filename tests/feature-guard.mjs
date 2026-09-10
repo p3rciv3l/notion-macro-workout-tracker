@@ -22,9 +22,9 @@ console.log('== static feature markers ==');
 check('Google Health bridge: OAuth routes + daily weight poll (Wyze->Fitbit->Google Health replaces the dead shortcut ingest, Owner 8/27)', /ghealth_tokens_v1/.test(src) && /dataTypes\/weight\/dataPoints/.test(src) && /async scheduled\(event, env, ctx\)/.test(src) && /\/health\/fitbit\/callback/.test(src), 'ghealth token store, weight endpoint, scheduled handler, or callback route missing');
 
 check('Average modifier button (Macros seg)', /data-avg="1">Average</.test(pageTpl), 'data-avg="1">Average button missing from page template');
-check('Logged-item search controls in Macros head (Owner 9/9: search button expands an input rightward, with 3 day / 7 day / All time search params)', /id="msrchbtn"/.test(pageTpl) && /id="msrchq"/.test(pageTpl) && /data-sw="3">3 day</.test(pageTpl) && /data-sw="7">7 day</.test(pageTpl) && /data-sw="0">All time</.test(pageTpl), 'search button, input, or range params missing from page template');
+check('Logged-item search controls in Macros head (Owner 9/9: a bare magnifier icon; click or fine-pointer hover opens a search row UNDER the head - head controls never move - with 3 day / 7 day / All time search params)', /class="sicn" id="msrchbtn"/.test(pageTpl) && /<svg[^>]*viewBox="0 0 24 24"[^>]*>.*<circle cx="10\.5"/.test(pageTpl) && /class="srchrow" id="msrchrow" hidden/.test(pageTpl) && /id="msrchq"/.test(pageTpl) && /data-sw="3">3 day</.test(pageTpl) && /data-sw="7">7 day</.test(pageTpl) && /data-sw="0">All time</.test(pageTpl), 'search icon button, hidden search row, input, or range params missing from page template');
 check('Logged-item search results container (minimalist row view, days left / item right)', /id="msrchres"/.test(pageTpl) && /class="sr"><span class="days"/.test(appJs), 'results container or day-left row markup missing');
-check('Logged-item search logic: typed text is the regex (literal fallback), matches full title + short name (app.js)', /function srchMatcher/.test(appJs) && /new RegExp\(q, 'i'\)/.test(appJs) && /function srchRender/.test(appJs) && /No logged items match\./.test(appJs), 'search matcher/renderer missing from app.js');
+check('Logged-item search logic: typed text is the regex (literal fallback), matches full title + short name; open state = click-pinned, fine-pointer hover, field focus, or a non-empty query (app.js)', /function srchMatcher/.test(appJs) && /new RegExp\(q, 'i'\)/.test(appJs) && /function srchRender/.test(appJs) && /function srchIsOpen/.test(appJs) && /hover:hover.*pointer:fine/.test(appJs) && /No logged items match\./.test(appJs), 'search matcher/renderer/open-state logic missing from app.js');
 check('3 day selector', /data-w="3">3 day</.test(pageTpl));
 check('7 day selector', /data-w="7">7 day</.test(pageTpl));
 check('All time selector', /data-w="0">All time</.test(pageTpl));
@@ -66,7 +66,7 @@ else {
   const wk = { splits: { Legs: [{ date: today, title: '', ex: { 'Ballerina Squat': [[135, 6]] }, w: { 'Ballerina Squat': 135 }, raw: {} }] }, errors: {} };
   const html = mod.chartPage(rows, { source: 'guard' }, wk, '', true, null, null, items);
   check('render: Average button in built HTML', html.includes('data-avg="1"'));
-  check('render: search UI in built HTML', html.includes('id="msrchbtn"') && html.includes('id="msrchq"') && html.includes('id="msrchres"') && html.includes('data-sw="0"'));
+  check('render: search UI in built HTML', html.includes('id="msrchbtn"') && html.includes('id="msrchrow"') && html.includes('id="msrchq"') && html.includes('id="msrchres"') && html.includes('data-sw="0"'));
   check('render: time selector in built HTML', ['data-w="3"', 'data-w="7"', 'data-w="0"'].every(m => html.includes(m)));
   check('render: item rows embedded for blow-ups', html.includes('guard test meal'), 'items payload not baked into page');
   check('render: workout session embedded', html.includes('Ballerina Squat'), 'workout session payload not baked into page');
