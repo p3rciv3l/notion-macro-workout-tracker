@@ -33,19 +33,6 @@ APP_MARKERS=(
   'eng.fills.estimate'  # workout band hatched in the in-chart blow-up stack (Owner 8/26: "the green block thing at the top remains")
 )
 
-# Google Health bridge: the OAuth kickoff must 302 to Google's consent
-# endpoint (Owner 8/27: Wyze->Fitbit->Google Health replaces shortcut ingest).
-GHLOC=""
-for i in $(seq 1 12); do
-  GHLOC=$(curl -fsS -o /dev/null -D - "$BASE/health/fitbit/auth?$CB&_=gh" 2>/dev/null | tr -d '\r' | awk 'BEGIN{IGNORECASE=1} /^location:/{print $2}' || true)
-  [ -n "$GHLOC" ] && break
-  sleep 10
-done
-case "$GHLOC" in
-  *accounts.google.com*) echo "smoke: /health/fitbit/auth redirects to Google consent ok" ;;
-  *) echo "SMOKE FAIL: /health/fitbit/auth did not redirect to Google consent (got: ${GHLOC:-none})" >&2; exit 1 ;;
-esac
-
 missing=""
 html=""
 for i in $(seq 1 12); do

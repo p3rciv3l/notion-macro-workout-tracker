@@ -19,7 +19,7 @@ const check = (feature, ok, detail = '') => {
 };
 
 console.log('== static feature markers ==');
-check('Google Health bridge: OAuth routes + daily weight poll (Wyze->Fitbit->Google Health replaces the dead shortcut ingest, Owner 8/27)', /ghealth_tokens_v1/.test(src) && /dataTypes\/weight\/dataPoints/.test(src) && /async scheduled\(event, env, ctx\)/.test(src) && /\/health\/fitbit\/callback/.test(src), 'ghealth token store, weight endpoint, scheduled handler, or callback route missing');
+check('No Fitbit/Google Health bridge anywhere (Owner 9/10: "there\'s no fitbit ever" - weight arrives only via Wyze/Apple Health ingest or manual text-ins; bridge code, OAuth routes, and the cron handler must stay gone)', !/ghealth|fitbit/i.test(src), 'Fitbit/Google Health bridge reference reappeared in worker source');
 
 check('Average modifier button (Macros seg)', /data-avg="1">Average</.test(pageTpl), 'data-avg="1">Average button missing from page template');
 check('Logged-item search controls (Owner 9/9: a bare magnifier icon, no box; click or fine-pointer hover unfolds the input INTO the legend row - legend items reflow around it, header never gains a row; no duplicate range picker)', /class="sicn" id="msrchbtn"/.test(pageTpl) && /<svg[^>]*viewBox="0 0 24 24"[^>]*>.*<circle cx="10\.5"/.test(pageTpl) && !/msrchrow/.test(pageTpl) && !/msrchseg/.test(pageTpl) && /sq\.id = 'msrchq'/.test(appJs) && /window\.__msrchq/.test(appJs) && /legEl\.appendChild\(sq\)/.test(appJs) && /legend input#msrchq/.test(src), 'bare search icon missing, a search row/picker is back, or the input is not inside the legend row');
