@@ -4330,7 +4330,7 @@ function wkSessions() {
 }
 
 function renderWorkout() {
-  const sess = wkSessions();
+  let sess = wkSessions();
   const names = [];
   /* Owner 8/15 ("you have to add leg press to this"): the legend lists every
      exercise EVER logged in this split, not just ones with a set inside the
@@ -4384,6 +4384,20 @@ function renderWorkout() {
     color: THEME.pastel[i % THEME.pastel.length],
     hidden: !!hidden[n]
   }));
+  /* Owner 9/9 ("weird gap on the left with the 90 day view"): an edge session
+     whose lifts are all X'd out (06/11 held only Paused Incline Press, off by
+     default) kept the axis open with dead space. Trim leading/trailing
+     sessions with no visible value. Middle sessions always stay (calendar-
+     true spacing is the 8/15 rule), and an edge day comes back the moment
+     its lift is un-hidden, since this re-runs on every legend toggle. */
+  const visAt = i => series.some(sr => !sr.hidden && sr.values[i] !== null && sr.values[i] !== undefined);
+  let lo = 0, hi = sess.length - 1;
+  while (lo < sess.length && !visAt(lo)) lo++;
+  while (hi >= lo && !visAt(hi)) hi--;
+  if (lo > 0 || hi < sess.length - 1) {
+    sess = sess.slice(lo, hi + 1);
+    series.forEach(sr => { sr.values = sr.values.slice(lo, hi + 1); });
+  }
   const host = document.getElementById('w');
   wkSvg.render(host, sess, names, series, (sidx, nidx) => {
     const hit = wkResolveClick(sess, sidx, names[nidx]);
