@@ -822,8 +822,13 @@ const CSS = `
      input INTO the legend row itself - legend items reflow around it, so
      the header never gains a row. Results follow the head's selected range
      and are quiet rows, days on the left / item on the right. */
-  .sicn { display:inline-flex; align-items:center; justify-content:center; padding:5px 4px; border:0; background:none; color:#797979; cursor:pointer; }
+  .sicn { display:inline-flex; align-items:center; justify-content:center; padding:3px 4px; border:0; background:none; color:#797979; cursor:pointer; }
   .sicn:hover, .sicn.on { color:#1a1a1a; }
+  /* Owner 9/9: the magnifier leads the Macros control cluster, immediately
+     left of Core; it takes over the auto-margin that pushed the cluster
+     right (on wrap/mobile the margin drops and it just sits before Core). */
+  #msrchbtn { margin-left:auto; }
+  #mgrp { margin-left:0; }
   .legend input#msrchq { flex:0 1 170px; width:170px; min-width:110px; max-width:100%; height:18px; box-sizing:border-box; margin:-3px 0; font:inherit; font-size:12px; line-height:1; color:#1a1a1a; background:#fff; border:1px solid #e4e4e4; border-radius:6px; padding:2px 8px; }
   .srchres { margin:10px 0 0; border-top:1px solid #e4e4e4; max-height:180px; overflow-y:auto; font-size:12px; }
   .srchres .sr { display:flex; align-items:baseline; gap:12px; padding:6px 0; border-bottom:1px solid #f0f0f0; }
@@ -1091,6 +1096,7 @@ const CSS = `
     .title { font-size:14px; }
     .head { flex-wrap:wrap; gap:8px 10px; }
     .head .seg { margin-left:0; }
+    #msrchbtn { margin-left:0; }
     .row2 { flex-wrap:wrap; gap:8px 10px; }
     .row2 .seg { margin-left:0; }
     .seg { max-width:100%; }
@@ -5715,6 +5721,7 @@ function chartPage(rows, meta, wk, token, ek, goals, hsnap, items) {
 <div class="card">
   <div class="head">
     <span class="title">Macros</span>
+    <button class="sicn" id="msrchbtn" type="button" aria-label="Search logged items"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.8"></circle><line x1="15.6" y1="15.6" x2="21" y2="21"></line></svg></button>
     <span class="seg" id="mgrp">
       <button data-g="core">Core</button><button data-g="detail">Detail</button><button data-g="all">All</button>
     </span>
@@ -5724,7 +5731,6 @@ function chartPage(rows, meta, wk, token, ek, goals, hsnap, items) {
     <span class="seg" id="mseg">
       <button data-w="3">3 day</button><button data-w="7">7 day</button><button data-w="0">All</button><button data-avg="1">Average</button>
     </span>
-    <button class="sicn" id="msrchbtn" type="button" aria-label="Search logged items"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.8"></circle><line x1="15.6" y1="15.6" x2="21" y2="21"></line></svg></button>
   </div>
   <div class="srchres" id="msrchres" hidden></div>
   <div class="legend" id="mlegend"></div>
