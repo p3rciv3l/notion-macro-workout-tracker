@@ -817,13 +817,14 @@ const CSS = `
   .seg + .seg { margin-left:0; }
   .seg button:last-child, .seg a:last-child { border-right:0; }
   .seg button.on, .seg a.on { background:#f4f4f4; color:#1a1a1a; font-weight:600; }
-  /* Logged-item search (Owner 9/9): a bare magnifier sits in the Macros
-     head; a click (or a hover on fine-pointer devices) opens the search row
+  /* Logged-item search (Owner 9/9): a bare magnifier (no box) sits in the
+     Macros head; a click (or a hover on fine-pointer devices) opens the
+     search row
      UNDER the head, so the head's own controls never move. The row is just
      the input - results follow the head's selected range. Results are quiet
      rows, days on the left / item on the right, in the page's type. */
-  .sicn { display:inline-flex; align-items:center; justify-content:center; padding:5px 7px; border:1px solid #e4e4e4; border-radius:6px; background:#fff; color:#797979; cursor:pointer; }
-  .sicn.on { background:#f4f4f4; color:#1a1a1a; }
+  .sicn { display:inline-flex; align-items:center; justify-content:center; padding:5px 4px; border:0; background:none; color:#797979; cursor:pointer; }
+  .sicn:hover, .sicn.on { color:#1a1a1a; }
   .srchrow { display:flex; align-items:center; flex-wrap:wrap; gap:6px; margin:10px 0 0; }
   .srchrow[hidden] { display:none; }
   .srchrow input { flex:0 1 220px; width:220px; min-width:120px; max-width:100%; font:inherit; font-size:12px; line-height:1; color:#1a1a1a; background:#fff; border:1px solid #e4e4e4; border-radius:6px; padding:6px 8px; }
@@ -5709,7 +5710,7 @@ function chartPage(rows, meta, wk, token, ek, goals, hsnap, items) {
       <button data-m="raw">Raw</button><button data-ms="opaque">Opaque</button><button data-ms="transparent">Clear</button>
     </span>
     <span class="seg" id="mseg">
-      <button data-w="3">3 day</button><button data-w="7">7 day</button><button data-w="0">All time</button><button data-avg="1">Average</button>
+      <button data-w="3">3 day</button><button data-w="7">7 day</button><button data-w="0">All</button><button data-avg="1">Average</button>
     </span>
     <button class="sicn" id="msrchbtn" type="button" aria-label="Search logged items"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.8"></circle><line x1="15.6" y1="15.6" x2="21" y2="21"></line></svg></button>
   </div>
