@@ -3221,10 +3221,22 @@ function macroLegend() {
       render(currentW);
       markGroup();
     });
-  // The search input lives in the legend row (Owner 9/9); drawLegend just
-  // wiped the row's children, so put the input back at the end.
-  const sq = document.getElementById('msrchq');
-  if (sq) legEl.appendChild(sq);
+  // The search input lives in the legend row (Owner 9/9). drawLegend's
+  // innerHTML wipe DESTROYS child nodes, so the field can't come from
+  // markup - create it once, hold it on window, and re-seat it at the end
+  // of the row after every legend re-render.
+  let sq = window.__msrchq;
+  if (!sq) {
+    sq = document.createElement('input');
+    sq.id = 'msrchq';
+    sq.type = 'text';
+    sq.placeholder = 'search';
+    sq.setAttribute('autocomplete', 'off');
+    sq.setAttribute('spellcheck', 'false');
+    sq.hidden = true;
+    window.__msrchq = sq;
+  }
+  legEl.appendChild(sq);
 }
 
 /* ---- Bar blow-up: clicking a bar fans it out into its item stack on a side
@@ -4191,7 +4203,7 @@ render(7);
 // a bare magnifier, and the input unfolds INTO the legend row - legend items
 // reflow around it; the header never gains a row.
 const srchBtn = document.getElementById('msrchbtn');
-const srchQ = document.getElementById('msrchq');
+const srchQ = window.__msrchq || document.getElementById('msrchq');
 const srchRes = document.getElementById('msrchres');
 const srchEsc = s => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 // Open state: pinned by a click, held open by a fine-pointer hover over the
@@ -5715,7 +5727,7 @@ function chartPage(rows, meta, wk, token, ek, goals, hsnap, items) {
     <button class="sicn" id="msrchbtn" type="button" aria-label="Search logged items"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.8"></circle><line x1="15.6" y1="15.6" x2="21" y2="21"></line></svg></button>
   </div>
   <div class="srchres" id="msrchres" hidden></div>
-  <div class="legend" id="mlegend"><input id="msrchq" type="text" placeholder="search" autocomplete="off" spellcheck="false" hidden></div>
+  <div class="legend" id="mlegend"></div>
   <div class="wrap"><div id="c" class="svghost"></div></div>
   <div class="foot" style="margin-top:8px"><a id="goalslink" href="/goals">Edit macro goals</a></div>
 </div>
