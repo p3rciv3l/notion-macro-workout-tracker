@@ -4060,7 +4060,8 @@ function render(w) {
         /* Owner 8/22: fixed 7-day lookback (today-7..today-1), window-independent. */
         const d0wk = new Date(todayS + 'T00:00:00'); d0wk.setDate(d0wk.getDate() - 7);
         const loS = isoLocal(d0wk);
-        const vs = ROWS.filter(r => r.date >= loS && r.date < todayS).map(r => r[m.key]).filter(v => v !== null && v !== undefined && isFinite(v));
+        /* Owner 10/7 ("for empty day/days, it should exclude that from the average set"): a day with no logged data (zero/null on every macro) is not a sample - drop it from the projection average. */
+        const vs = ROWS.filter(r => r.date >= loS && r.date < todayS && ['calories','protein','carbs','fat','satfat','sugar','fiber','sodium'].some(k => isFinite(r[k]) && r[k] > 0)).map(r => r[m.key]).filter(v => v !== null && v !== undefined && isFinite(v));
         if (vs.length) { vals[pi] = round1(vs.reduce((a, v) => a + v, 0) / vs.length); any = true; }
       }
     });

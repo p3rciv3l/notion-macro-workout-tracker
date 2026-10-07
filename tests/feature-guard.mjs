@@ -53,6 +53,7 @@ check('data.json streams items live', /ITEMS/.test(appJs) && /items/.test(src));
 check('Workout-only day synthesis (Owner 8/25)', /negative net calories/.test(src) && /minFoodDay/.test(src), 'freshRows no longer synthesizes zero rows for workout-only days');
 check('One-off per-date workout burn overrides (owner-texted actuals: 2026-08-27 = 350 kcal, 2026-09-02 = 600 kcal; NOT a recalibration of the split rule)', /BURN_OVERRIDES = \{ "2026-08-27": 350, "2026-09-02": 600 \}/.test(src) && /if \(o != null\) return o/.test(src), 'per-date burn override missing');
 check('Workout burn split rule Legs 250 / else 200', /has\('Legs'\) \? 250 : \(has\('Push'\) \|\| has\('Pull'\)\) \? 200 : 0/.test(src), 'wkBurnFor no longer returns Legs 250 / Push-Pull 200');
+check('Projection average skips empty days (Owner 10/7: "for empty day/days, it should exclude that from the average set" - a day with every macro zero/null is not a sample in the dashed today projection)', /ROWS\.filter\(r => r\.date >= loS && r\.date < todayS && \['calories','protein','carbs','fat','satfat','sugar','fiber','sodium'\]\.some\(k => isFinite\(r\[k\]\) && r\[k\] > 0\)\)/.test(src), 'empty-day exclusion missing from the ghost projection average');
 
 console.log('== functional render test ==');
 const tmp = mkdtempSync(join(tmpdir(), 'cbum-'));
