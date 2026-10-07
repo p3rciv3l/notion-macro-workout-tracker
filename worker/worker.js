@@ -1,5 +1,5 @@
 const CAL_TARGET = 1950;
-const PRO_TARGET = 135;
+const PRO_TARGET = 150;
 const COOKIE = "cbum_gate";
 const COOKIE_P = "cbum_gate_p";
 const CACHE_KEY = "rows_cache_v1";
@@ -22,7 +22,7 @@ const ORDER_KEY = "col_order_v1";
 const GOALS_KEY = "goals_v1";
 // Example starting targets. The owner can change any of them at /goals;
 // whatever is saved there wins over these defaults.
-const DEFAULT_GOALS = { calories: 1950, protein: 135, carbs: 198, fat: 60, satfat: 15, sugar: 50, fiber: 30, sodium: 2300 };
+const DEFAULT_GOALS = { calories: 1950, protein: 150, carbs: 198, fat: 60, satfat: 15, sugar: 50, fiber: 30, sodium: 2300 };
 const GOAL_FIELDS = [
   ["calories", "Calories", "kcal"], ["protein", "Protein", "g"], ["carbs", "Carbs", "g"], ["fat", "Fat", "g"],
   ["satfat", "Saturated fat", "g"], ["sugar", "Sugar", "g"], ["fiber", "Fiber", "g"], ["sodium", "Sodium", "mg"]
@@ -118,6 +118,7 @@ async function authed(req, env, url) {
   return false;
 }
 
+
 // Full rendered page snapshot: the chart route must feel instant even on a cold
 // isolate, so we serve the last built HTML while a fresh build runs behind it.
 // Only the embed-token variant is cached: the authed-cookie variant embeds the
@@ -145,9 +146,10 @@ async function buildChartPage(env, ctx, ekLive) {
   if (rowsR.at && (rowsR.at > MEM.itemsAt || itemsMissing)) {
     try { items = await freshItems(env); } catch (e) {}
   }
+  const hsnap = null;
   try { if (shortRaw) items.__short = JSON.parse(shortRaw); } catch (e) {}
   const token = ekLive ? "" : await sessionToken(env);
-  const html = chartPage(rows, { source }, wk, token, ekLive, goals, items);
+  const html = chartPage(rows, { source }, wk, token, ekLive, goals, hsnap, items);
   try { console.log("page build", Date.now() - t0, "ms"); } catch (e) {}
   return html;
 }
@@ -170,7 +172,48 @@ async function edgePagePurge(origin, env) {
   try {
     const k = await embedToken(env);
     await caches.default.delete(edgePageKey(origin, "/", k));
+    await caches.default.delete(edgePageKey(origin, "/health", k));
   } catch (e) {}
+}
+
+const HPAGE_KEY = "cbum:health:html";
+let HPAGE = null; let HPAGE_AT = 0;
+
+async function buildHealthPage(env, ctx, ekLive) {
+  const { snap } = await getHealthSnapshot(env, ctx);
+  const token = ekLive ? "" : await sessionToken(env);
+  return healthPage(healthDisplay(snap), token, ekLive);
+}
+
+async function refreshHealthPage(env, ctx, ekLive) {
+  try {
+    const html = await buildHealthPage(env, ctx, ekLive);
+    HPAGE = html; HPAGE_AT = Date.now();
+    try { await env.CHART_KV.put(HPAGE_KEY, html); } catch (e) {}
+  } catch (e) {}
+}
+
+async function getHealthPageHtml(env, ctx, ekLive, preP) {
+  if (ekLive) {
+    if (HPAGE) {
+      if (Date.now() - HPAGE_AT >= PAGE_TTL_MS) bg(ctx, "hpage", () => refreshHealthPage(env, ctx, ekLive));
+      return HPAGE;
+    }
+    try {
+      const snap = preP ? await preP : await env.CHART_KV.get(HPAGE_KEY);
+      if (snap) {
+        HPAGE = snap; HPAGE_AT = Date.now();
+        bg(ctx, "hpage", () => refreshHealthPage(env, ctx, ekLive));
+        return snap;
+      }
+    } catch (e) {}
+  }
+  const html = await buildHealthPage(env, ctx, ekLive);
+  if (ekLive) {
+    HPAGE = html; HPAGE_AT = Date.now();
+    try { await env.CHART_KV.put(HPAGE_KEY, html); } catch (e) {}
+  }
+  return html;
 }
 
 async function getPageHtml(env, ctx, ekLive, preP) {
@@ -306,6 +349,27 @@ async function freshRows(env, ctx) {
       rows.sort((a, b) => (a.date < b.date ? -1 : 1));
     }
   } catch (e) { /* rollup-only fallback: keep the chart working if items fail */ }
+  /* Owner 8/25 ("if you see something pop up for a day then it needs to do
+     the negative net calories... if it's legs you do 250 and that's the only
+     diff"): a day with a workout session but no food logged yet still gets a
+     zero row, so the day renders and its Calories blow-up carries the burn
+     estimate (wkBurnFor: Legs 250, Push/Pull 200) and the negative net.
+     Scoped to the tracking era (>= the earliest food day) so pre-tracker
+     history doesn't fill with empty bars. */
+  try {
+    const wkD = await getWorkout(env, ctx || null);
+    const have2 = new Set(rows.map(r => r.date));
+    const minFoodDay = rows.length ? rows[0].date : null;
+    const extra = new Set();
+    for (const split of Object.keys((wkD && wkD.splits) || {})) {
+      for (const sess of wkD.splits[split] || []) {
+        const d = sess && sess.date;
+        if (d && /^\d{4}-\d{2}-\d{2}$/.test(d) && !have2.has(d) && (!minFoodDay || d >= minFoodDay)) extra.add(d);
+      }
+    }
+    for (const day of extra) rows.push({ date: day, calories: 0, protein: 0, carbs: 0, fat: 0, satfat: 0, sugar: 0, fiber: 0, sodium: 0 });
+    if (extra.size) rows.sort((a, b) => (a.date < b.date ? -1 : 1));
+  } catch (e) { /* food-only fallback: never let a workout read break the chart */ }
   await seedRowsSig(env);
   const sg = sig(JSON.stringify(rows));
   const changed = sg !== MEM.rowsSig;
@@ -370,9 +434,16 @@ async function notionItems(env) {
       const d = props.Date && props.Date.date && props.Date.date.start;
       if (!d) continue;
       const num = (name) => { const v = props[name]; return v && v.type === "number" ? (v.number || 0) : 0; };
+      /* Owner 8/23 ("sodium 176 on a day with mac and two samosas is
+         impossible"): a blank nutrient used to arrive as 0 and vanish into the
+         day sum, so a partial total rendered as a confident one. Tuple slot 10
+         records which nutrients THIS row left blank, so the chart can say so. */
+      const blank = (name) => { const v = props[name]; return !(v && v.type === "number" && v.number !== null && v.number !== undefined); };
+      const gaps = [["Calories","calories"],["Protein","protein"],["Carbs","carbs"],["Fat","fat"],["Saturated Fat","satfat"],["Sugar","sugar"],["Fiber","fiber"],["Sodium","sodium"]]
+        .filter(pair => blank(pair[0])).map(pair => pair[1]).join(",");
       const title = props.Meal && props.Meal.title && props.Meal.title[0] ? props.Meal.title[0].plain_text : "item";
       const day = d.slice(0, 10);
-      (byDay[day] = byDay[day] || []).push([title, num("Calories"), num("Protein"), num("Carbs"), num("Fat"), num("Saturated Fat"), num("Sugar"), num("Fiber"), num("Sodium"), "https://www.notion.so/" + String(p.id || "").replace(/-/g, "")]);
+      (byDay[day] = byDay[day] || []).push([title, num("Calories"), num("Protein"), num("Carbs"), num("Fat"), num("Saturated Fat"), num("Sugar"), num("Fiber"), num("Sodium"), "https://www.notion.so/" + String(p.id || "").replace(/-/g, ""), gaps]);
     }
     cursor = data.has_more ? data.next_cursor : undefined;
   } while (cursor);
@@ -746,6 +817,25 @@ const CSS = `
   .seg + .seg { margin-left:0; }
   .seg button:last-child, .seg a:last-child { border-right:0; }
   .seg button.on, .seg a.on { background:#f4f4f4; color:#1a1a1a; font-weight:600; }
+  /* Logged-item search (Owner 9/9): a bare magnifier (no box) sits in the
+     Macros head; a click (or a hover on fine-pointer devices) unfolds the
+     input INTO the legend row itself - legend items reflow around it, so
+     the header never gains a row. Results follow the head's selected range
+     and are quiet rows, days on the left / item on the right. */
+  .sicn { display:inline-flex; align-items:center; justify-content:center; padding:3px 4px; border:0; background:none; color:#797979; cursor:pointer; }
+  .sicn:hover, .sicn.on { color:#1a1a1a; }
+  /* Owner 9/9: the magnifier leads the Macros control cluster, immediately
+     left of Core; it takes over the auto-margin that pushed the cluster
+     right (on wrap/mobile the margin drops and it just sits before Core). */
+  #msrchbtn { margin-left:auto; }
+  #mgrp { margin-left:0; }
+  .legend input#msrchq { flex:0 1 170px; width:170px; min-width:110px; max-width:100%; height:18px; box-sizing:border-box; margin:-3px 0; font:inherit; font-size:12px; line-height:1; color:#1a1a1a; background:#fff; border:1px solid #e4e4e4; border-radius:6px; padding:2px 8px; }
+  .srchres { margin:10px 0 0; border-top:1px solid #e4e4e4; max-height:180px; overflow-y:auto; font-size:12px; }
+  .srchres .sr { display:flex; align-items:baseline; gap:12px; padding:6px 0; border-bottom:1px solid #f0f0f0; }
+  .srchres .sr:last-child { border-bottom:0; }
+  .srchres .sr .days { flex:0 0 auto; color:#797979; }
+  .srchres .sr .nm { flex:1 1 auto; min-width:0; color:#1a1a1a; }
+  .srchres .srempty { padding:8px 0; color:#797979; }
   /* Owner 8/15: the Line/Opaque toggle sits centered in the gap between the
      split tabs and the date-range seg, not pinned to the far right. */
   .legend { display:flex; align-items:center; flex-wrap:wrap; gap:9px 22px; margin:14px 0 14px; }
@@ -781,6 +871,9 @@ const CSS = `
   .svgtip .r { display:flex; align-items:center; height:14.4px; }
   .svgtip .r + .r { margin-top:2px; }
   .svgtip .chip { width:12px; height:12px; display:inline-block; margin-right:14px; flex:0 0 auto; }
+  /* Partial-day marks (Owner 8/23): amber, never the same weight as a real number. */
+  .svgtip .pt { color:#b06a00; margin-left:8px; font-size:11px; }
+  .svgtip .pb { color:#b06a00; font-weight:600; }
   /* Stacked-view day blow-up: full-bleed bands that cancel the panel padding */
   .daystack { margin:0 -6px 10px -10px; }
   .daystack .ds-band { display:flex; height:44px; }
@@ -1003,6 +1096,7 @@ const CSS = `
     .title { font-size:14px; }
     .head { flex-wrap:wrap; gap:8px 10px; }
     .head .seg { margin-left:0; }
+    #msrchbtn { margin-left:0; }
     .row2 { flex-wrap:wrap; gap:8px 10px; }
     .row2 .seg { margin-left:0; }
     .seg { max-width:100%; }
@@ -1011,6 +1105,7 @@ const CSS = `
     .legend .item { font-size:11px; gap:6px; }
     .legend .x { margin-left:0; padding:6px; margin:-6px -6px -6px 0; font-size:13px; }
     .cust input, .cust select { padding:7px 8px; }
+    .srchres { max-height:150px; }
     .cust select { padding-right:22px; }
     .card + .card { margin-top:18px; padding-top:16px; }
   }
@@ -1062,6 +1157,23 @@ ${backScript}
 }
 
 
+const HEALTH_CSS = `
+  .hsec { flex:none; }
+  .hcards { display:grid; gap:22px 26px; grid-template-columns:repeat(auto-fit,minmax(420px,1fr)); margin-top:6px; }
+  .hcard { display:flex; flex-direction:column; }
+  .hcard .htitle { font-size:13px; font-weight:600; }
+  .hcard .hnote { font-size:11.5px; color:#797979; margin:1px 0 6px; }
+  .hcard .wrap { height:230px; min-height:230px; max-height:230px; }
+  .hcard .legend { margin:10px 0 0; gap:8px 16px; }
+  .hcard table { width:100%; border-collapse:collapse; font-size:12px; margin-top:8px; }
+  .hcard th, .hcard td { text-align:left; padding:4px 6px; border-bottom:1px solid #f0f0f0; white-space:nowrap; }
+  .hcard th { color:#797979; font-weight:500; }
+  .hscroll { max-height:170px; overflow:auto; }
+  /* A card with nothing in it yet shouldn't hold open 230px of blank space. */
+  .hcard .wrap:has(.empty) { height:auto; min-height:0; max-height:none; }
+  .hcard .empty { font-size:12px; color:#9a9a9a; padding:8px 0 2px; }
+  @media (max-width: 900px) { .hcards { grid-template-columns:1fr; } }
+`;
 
 // The chart app body: static JS served external at /app.js so repeat loads use
 // the immutable cache instead of re-parsing 200KB of inline script on every nav.
@@ -1094,6 +1206,18 @@ let ITEMS = window.__D.items;
 const SHORTS = ITEMS.__short || {}; delete ITEMS.__short;
 // Item tuple: [name, calories, protein, carbs, fat, satfat, sugar, fiber, sodium]
 const ITEM_KEYS = ['calories','protein','carbs','fat','satfat','sugar','fiber','sodium'];
+/* Owner 8/23: item tuple slot 10 lists the nutrients that row left blank in
+   Notion. A day is PARTIAL for a nutrient when any of its rows left that
+   nutrient blank - the bar and the tooltip number are then a floor, not a
+   total, and must never render as a plain figure. */
+function itemGaps(it) { const g = it && it[10]; return g ? String(g).split(',') : []; }
+function gapCount(date, key) {
+  const list = (date && ITEMS[date]) || [];
+  let n = 0;
+  for (let i = 0; i < list.length; i++) if (itemGaps(list[i]).indexOf(key) >= 0) n++;
+  return n;
+}
+function dayItemCount(date) { return ((date && ITEMS[date]) || []).length; }
 const CAL_TARGET = window.__D.calTarget, PRO_TARGET = window.__D.proTarget;
 const GREEN = '#3E7C4F', ORANGE = '#eb6e00', GRID = '#ececec', AXIS = '#c1c1c1', TICK = '#797979';
 // Every macro the tracker rolls up. goal:null means no target has been set for
@@ -2124,7 +2248,11 @@ const SVGCharts = (function () {
      blue, teal and blended into red. UNIVERSAL over-goal stripe = white,
      over a faint red wash that keeps the over-goal = red cue. */
         '<pattern id="' + uid + 'ovh" width="6" height="6" patternUnits="userSpaceOnUse"><path d="M-1.5,4.5 l3,3 M0,0 l6,6 M4.5,-1.5 l3,3" stroke="rgba(255,255,255,0.95)" stroke-width="1.7"/></pattern>' +
-        '<pattern id="' + uid + 'ovhdrk" width="6" height="6" patternUnits="userSpaceOnUse"><path d="M-1.5,4.5 l3,3 M0,0 l6,6 M4.5,-1.5 l3,3" stroke="rgba(110,10,25,0.95)" stroke-width="1.7"/></pattern></defs>' +
+        '<pattern id="' + uid + 'ovhdrk" width="6" height="6" patternUnits="userSpaceOnUse"><path d="M-1.5,4.5 l3,3 M0,0 l6,6 M4.5,-1.5 l3,3" stroke="rgba(110,10,25,0.95)" stroke-width="1.7"/></pattern>' +
+        /* Estimate hatch (Owner 8/26): diagonal grey-white stripes matching the
+           blow-up panel's .bseg-wo - the generic "this is an estimate, not
+           food" fill, exposed to overlays as fills.estimate. */
+        '<pattern id="' + uid + 'esth" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="6" height="6" fill="#fafbfc"/><line x1="0" y1="0" x2="0" y2="6" stroke="#ced3da" stroke-width="2"/></pattern></defs>' +
         parts.join('') + '</svg>';
       const oldTip = tip.parentNode ? null : null;
       host.innerHTML = '';
@@ -2133,6 +2261,12 @@ const SVGCharts = (function () {
       eng.svg = host.querySelector('svg');
       // bar element references for hover shade + hit tests
       eng.barEls = eng.svg.querySelectorAll('rect.bar');
+      /* Generic post-render hooks (Owner 8/26: "there's some dependencies you
+         need to break"). Every render rebuilds the svg from scratch, dropping
+         ephemeral overlays; an overlay repaints itself through onRender
+         instead of the engine naming it here (the blow-up stack used to be
+         re-applied by name at this exact spot). */
+      for (const h of (eng.renderHooks || [])) h();
     }
 
     function axisBorder(s, pos, A, dpr, theme) {
@@ -2364,17 +2498,30 @@ const SVGCharts = (function () {
       /* Ghost slot: values come from model.ghosts (not ds.data), and the
          title carries a green Projected badge (Owner 8/15). */
       const proj = els.some(e => e.proj) && model.ghostAt != null && idx === model.ghostAt && model.ghosts;
+      /* Owner 8/23: a nutrient with blank rows behind it reads "1,240+" with an
+         amber "partial" note, and the day title carries a partial badge. A
+         glance at the card has to show the number is a floor. */
+      const dts = model.dayDates;
+      const date = (!proj && dts) ? dts[idx] : null;
+      let anyPartial = false;
       let rows = '';
       for (const e of els) {
         const dsm = model.datasets[e.di];
         const v = proj ? model.ghosts[e.di] : dsm.data[idx];
         if (v === null || v === undefined || !isFinite(v)) continue;
+        /* Owner 8/26: the Calories figure is NET - gross intake minus the
+           day's estimated workout burn (Aug 26: 1,175 gross -> 975 net). */
+        const vNet = (!proj && dsm.key === 'calories' && date) ? v - wkBurnFor(date) : v;
+        const miss = (date && dsm.key) ? gapCount(date, dsm.key) : 0;
+        if (miss) anyPartial = true;
         rows += '<div class="r"><span class="chip" style="background:' + dsm.color + '"></span><span>' +
-          escXml(dsm.label) + ': ' + escXml(new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 }).format(Math.round(v))) + '</span></div>';
+          escXml(dsm.label) + ': ' + escXml(new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 }).format(Math.round(vNet))) + (miss ? '+' : '') + '</span>' +
+          (miss ? '<span class="pt">partial &middot; ' + miss + ' of ' + dayItemCount(date) + ' items missing</span>' : '') + '</div>';
       }
       if (!rows) return null;
       return '<div class="t">' + escXml(title) +
-        (proj ? ' <span style="color:#3E7C4F;font-weight:600">&middot; Projected</span>' : '') + '</div>' + rows;
+        (proj ? ' <span style="color:#3E7C4F;font-weight:600">&middot; Projected</span>' : '') +
+        (anyPartial ? ' <span class="pb">&middot; partial</span>' : '') + '</div>' + rows;
     }
     /* Workout-chart tooltip feel for macros too (Owner 8/15, live prod: "not
        nearly as buttery"): ONE shared glide rule - the card follows the live
@@ -2724,7 +2871,7 @@ const SVGCharts = (function () {
       if (!el) return false;
       const tot = segs.reduce((a, s) => a + s.v, 0);
       if (!tot) return false;
-      eng.focus = { di: di, i: idx, el: el, prevDisplay: el.style.display };
+      eng.focus = { di: di, i: idx, el: el, prevDisplay: el.style.display, segs: segs };
       facade.data.datasets[di] = facade.data.datasets[di] || {};
       el.setAttribute('display', 'none');
       const gg = document.createElementNS('http://www.w3.org/2000/svg', 'g');
@@ -2738,7 +2885,7 @@ const SVGCharts = (function () {
         const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
         rect.setAttribute('x', rn2(b.x)); rect.setAttribute('y', rn2(ycur));
         rect.setAttribute('width', rn2(b.w)); rect.setAttribute('height', rn2(Math.max(h, 0)));
-        rect.setAttribute('fill', s.color);
+        rect.setAttribute('fill', s.fill || s.color); // per-seg fill override (e.g. the hatched estimate band)
         gg.appendChild(rect);
       }
       // keep the frame/goal lines above the repaint like the canvas build
@@ -2868,6 +3015,12 @@ const SVGCharts = (function () {
       },
       focusBar: focusBar,
       clearFocus: clearFocus,
+      /* Named fills + post-render hooks: the generic primitives overlays
+         compose from, keeping overlay-specific code (the blow-up stack) out
+         of the engine (Owner 8/26: "break the dependencies"). */
+      fills: { estimate: 'url(#' + uid + 'esth)' },
+      onRender: function (cb) { (eng.renderHooks = eng.renderHooks || []).push(cb); },
+      focusState: function () { return eng.focus; },
       chartArea: () => eng.chartArea,
       fake: facade,
       host: host
@@ -3064,7 +3217,8 @@ document.querySelectorAll('#mgrp button').forEach(b =>
   b.addEventListener('click', () => applyGroup(b.dataset.g)));
 
 function macroLegend() {
-  drawLegend(document.getElementById('mlegend'),
+  const legEl = document.getElementById('mlegend');
+  drawLegend(legEl,
     MACROS.map(m => ({ label: m.label, color: m.color, off: !!mHidden[m.key] })),
     label => {
       const m = MACROS.find(x => x.label === label);
@@ -3073,6 +3227,22 @@ function macroLegend() {
       render(currentW);
       markGroup();
     });
+  // The search input lives in the legend row (Owner 9/9). drawLegend's
+  // innerHTML wipe DESTROYS child nodes, so the field can't come from
+  // markup - create it once, hold it on window, and re-seat it at the end
+  // of the row after every legend re-render.
+  let sq = window.__msrchq;
+  if (!sq) {
+    sq = document.createElement('input');
+    sq.id = 'msrchq';
+    sq.type = 'text';
+    sq.placeholder = 'search';
+    sq.setAttribute('autocomplete', 'off');
+    sq.setAttribute('spellcheck', 'false');
+    sq.hidden = true;
+    window.__msrchq = sq;
+  }
+  legEl.appendChild(sq);
 }
 
 /* ---- Bar blow-up: clicking a bar fans it out into its item stack on a side
@@ -3681,10 +3851,34 @@ function alignBlowList(panel) {
 // Workout burn estimate (Owner 8/19): flat retroactive burn by split for the
 // day's Calories breakdown - Legs 250, Push/Pull 200 - never stored in
 // Notion; computed at render from the Notion session dates already in WK.
+// One-off reported burns: actuals the owner texted, applied in place for a
+// date (2026-08-27: 350 kcal, "fucking crazy" session; 2026-09-02: 600 kcal, hard morning bike ride). This is NOT a
+// recalibration - the flat-split estimate below stays the default everywhere
+// else; add a date here only when the owner reports an actual.
+const BURN_OVERRIDES = { "2026-08-27": 350, "2026-09-02": 600 };
 function wkBurnFor(dateStr) {
+  const o = BURN_OVERRIDES[dateStr];
+  if (o != null) return o;
   const wk = WK || {};
   const has = split => ((wk && wk[split]) || []).some(sess => sess.date === dateStr);
   return has('Legs') ? 250 : (has('Push') || has('Pull')) ? 200 : 0;
+}
+/* The blow-up's in-chart stack (Owner 8/26: "the green block thing at the
+   top remains" + "there's some dependencies you need to break"). Everything
+   blow-up-specific lives here instead of inside the chart engine: the
+   estimated workout band gets the hatched estimate fill (matching the
+   panel's .bseg-wo - reads as an estimate, not food), and the stack
+   re-applies itself through the generic onRender hook whenever the engine
+   rebuilds the svg (a resize used to wipe it). The engine only knows
+   colored bands, named fills, and hooks. */
+function drawBlowStack(eng, di, i, segs) {
+  const mapped = segs.map(s => s.wo ? Object.assign({}, s, { fill: eng.fills.estimate }) : s);
+  const ok = eng.focusBar(di, i, mapped);
+  if (ok && !eng.__blowHooked) {
+    eng.__blowHooked = 1;
+    eng.onRender(function () { const f = eng.focusState(); if (f && f.segs) eng.focusBar(f.di, f.i, f.segs); });
+  }
+  return ok;
 }
 function openMacroBlow(cv, row, m, onLeft, di, i) {
   const idx = ITEM_KEYS.indexOf(m.key) + 1; // tuple[0] is the item name
@@ -3697,14 +3891,14 @@ function openMacroBlow(cv, row, m, onLeft, di, i) {
   const segs = entries.map((e, i) => ({ name: e.name, v: e.v, color: colors[i], url: e.url, rec: e.rec }));
   // Hatched estimated-burn segment pinned at the top of the Calories stack.
   const wob = m.key === 'calories' ? wkBurnFor(row.date) : 0;
-  if (wob) segs.unshift({ name: 'Workout', v: wob, color: m.color, wo: 1, disp: '-' + wob + ' est' });
+  if (wob) segs.unshift({ name: 'Workout', v: wob, color: m.color, wo: 1, disp: '-' + wob + ' kcal' });
   let focus = null;
   const eng = cv && cv.__svgChart;
   if (eng && di != null && i != null && segs.length) {
     // The rendering engine hides the bar rect and stacks the item bands in
     // place; hover over it keeps the exact band palette (same effect as the
     // canvas build's per-index hover swap).
-    if (eng.focusBar(di, i, segs)) {
+    if (drawBlowStack(eng, di, i, segs)) {
       focus = { chart: eng.fake, di: di, color: m.color, hover: 0 };
     }
   }
@@ -3730,6 +3924,17 @@ function openDayBlow(cv, row, onLeft) {
      'dayblow' class (it hides the stacked bar) and do NOT insert .daystack. */
   blowPanel(cv, fmt(row.date), segs, 'kcal', row.calories || segs.reduce((a, s) => a + s.v, 0), onLeft, null, DAY_PAGES[row.date] || null);
 }
+const SLEEP_STAGES = [['deep', 'Deep', '#7ba6ee'], ['core', 'Core', '#b193de'], ['rem', 'REM', '#ec8c8c'], ['awake', 'Awake', '#c9ced6']];
+function openSleepBlow(cv, day, onLeft) {
+  const by = new Map((HSNAP.sleep || []).map(s => [s.day, s]));
+  const s = by.get(day);
+  if (!s) return;
+  const segs = SLEEP_STAGES.map(([k, name, color]) => ({ name: name, v: s[k] != null ? s[k] / 60 : 0, color: color }))
+    .filter(e => e.v > 0)
+    .sort((a, b) => a.v - b.v);
+  blowPanel(cv, fmt(day) + ' · Sleep', segs, 'hr', null, onLeft);
+}
+
 let goalLinesOn = false; // Owner 8/17: triple-tap toggles the colored goal lines
 function render(w) {
   currentW = w;
@@ -3770,7 +3975,7 @@ function render(w) {
     labels.push('Average');
     avgDaysLabel = n + ' logged day' + (n === 1 ? '' : 's');
     datasets = means.map(x => ({
-      kind: mMode === 'smooth' ? 'smooth' : 'bar', label: x.m.label, data: [x.avg === null ? null : round1(x.avg)],
+      kind: mMode === 'smooth' ? 'smooth' : 'bar', key: x.m.key, label: x.m.label, data: [x.avg === null ? null : round1(x.avg)],
       color: x.m.color, hover: shade(x.m.color, 0.16), axis: axisFor(x.m),
       goal: (x.m.goal === null || x.m.goal === undefined) ? null : x.m.goal
     }));
@@ -3784,7 +3989,7 @@ function render(w) {
     }
   } else if (mMode === 'smooth') {
     datasets = plotted.map(m => ({
-      kind: 'smooth', label: m.label, data: slots.map(r => (r ? r[m.key] : null)),
+      kind: 'smooth', key: m.key, label: m.label, data: slots.map(r => (r ? r[m.key] : null)),
       // Opaque view (Owner 8/15): same dual axes as the clear view (kcal/mg left,
       // grams right) but fills render SOLID - no transparency. Hierarchy is
       // paint order only: the lower the series' raw number, the later it paints
@@ -3808,7 +4013,7 @@ function render(w) {
     }
   } else {
     datasets = plotted.map(m => ({
-      kind: 'bar', label: m.label, data: slots.map(r => (r ? r[m.key] : null)), axis: axisFor(m),
+      kind: 'bar', key: m.key, label: m.label, data: slots.map(r => (r ? r[m.key] : null)), axis: axisFor(m),
       color: m.color, hover: shade(m.color, 0.16)
     }));
   }
@@ -3981,16 +4186,106 @@ document.querySelectorAll('#mseg button').forEach(b => b.addEventListener('click
     avgOn = !avgOn;
     b.classList.toggle('on', avgOn);
     render(currentW);
+    srchRender();
     return;
   }
   document.querySelectorAll('#mseg [data-w]').forEach(x => x.classList.remove('on'));
   b.classList.add('on');
   render(Number(b.dataset.w));
+  srchRender();
 }));
 document.querySelector('#mmode [data-m="raw"]').classList.add('on');
 document.querySelector('#mseg [data-w="7"]').classList.add('on');
 render(7);
 
+/* ---------------- Logged-item search (Owner 9/9) ---------------- */
+// "search for specific food items using a simple regex that matches the exact
+// search term in logged items": the typed text IS the pattern (an invalid
+// pattern falls back to a literal match), tested against each logged item's
+// full title and its short display name. Results are quiet rows - days on
+// the left, item on the right - over the head's selected range (9/9: no
+// separate range picker in the search row - "why does this spawn a random,
+// addition 3/7/all time thing"). Per the 9/9 follow-ups the head holds only
+// a bare magnifier, and the input unfolds INTO the legend row - legend items
+// reflow around it; the header never gains a row.
+const srchBtn = document.getElementById('msrchbtn');
+const srchQ = window.__msrchq || document.getElementById('msrchq');
+const srchRes = document.getElementById('msrchres');
+const srchEsc = s => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+// Open state: pinned by a click, held open by a fine-pointer hover over the
+// icon or row, by focus in the field, or by a non-empty query. Hover opens
+// are transient - leave with an empty, unfocused field and it closes.
+let srchPinned = false;
+let srchCloseT = null;
+const srchHoverable = window.matchMedia && matchMedia('(hover:hover) and (pointer:fine)').matches;
+function srchIsOpen() {
+  return srchPinned
+    || (srchHoverable && (srchBtn.matches(':hover') || srchQ.matches(':hover')))
+    || document.activeElement === srchQ
+    || !!srchQ.value.trim();
+}
+function srchApply() {
+  clearTimeout(srchCloseT);
+  const open = srchIsOpen();
+  srchBtn.classList.toggle('on', open);
+  srchQ.hidden = !open;
+  srchRender();
+}
+function srchQueueClose() {
+  clearTimeout(srchCloseT);
+  srchCloseT = setTimeout(srchApply, 160);
+}
+function srchMatcher(q) {
+  try { return new RegExp(q, 'i'); }
+  catch (e) {
+    const bs = String.fromCharCode(92);
+    const specials = bs + '^$.*+?()[]{}|';
+    return new RegExp(q.split('').map(ch => specials.indexOf(ch) >= 0 ? bs + ch : ch).join(''), 'i');
+  }
+}
+function srchRender() {
+  const q = srchQ.value.trim();
+  if (!q || srchQ.hidden) { srchRes.hidden = true; srchRes.innerHTML = ''; return; }
+  const re = srchMatcher(q);
+  let cutoff = null;
+  if (currentW) {
+    const dd = new Date(); dd.setDate(dd.getDate() - (currentW - 1));
+    cutoff = dd.getFullYear() + '-' + String(dd.getMonth() + 1).padStart(2, '0') + '-' + String(dd.getDate()).padStart(2, '0');
+  }
+  const hits = {};
+  Object.keys(ITEMS).forEach(day => {
+    const list = ITEMS[day];
+    if (!Array.isArray(list)) return;
+    if (cutoff && day < cutoff) return;
+    list.forEach(it => {
+      const raw = String(it[0] || '');
+      const disp = SHORTS[raw] || raw.replace(/ \\([^)]*\\)$/, '');
+      if (!re.test(raw) && !re.test(disp)) return;
+      (hits[disp] = hits[disp] || {})[day] = 1;
+    });
+  });
+  const names = Object.keys(hits).sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
+  srchRes.hidden = false;
+  srchRes.innerHTML = names.length
+    ? names.map(nm => {
+        const all = Object.keys(hits[nm]).sort().reverse();
+        const shown = all.length > 6 ? all.slice(0, 5).map(fmt).join(', ') + ' +' + (all.length - 5) + ' more' : all.map(fmt).join(', ');
+        return '<div class="sr"><span class="days">' + shown + '</span><span class="nm">' + srchEsc(nm) + '</span></div>';
+      }).join('')
+    : '<div class="srempty">No logged items match.</div>';
+}
+srchBtn.addEventListener('click', () => {
+  if (srchIsOpen()) { srchPinned = false; srchQ.value = ''; srchQ.blur(); }
+  else { srchPinned = true; srchQ.focus(); }
+  srchApply();
+});
+srchBtn.addEventListener('mouseenter', srchApply);
+srchBtn.addEventListener('mouseleave', srchQueueClose);
+srchQ.addEventListener('mouseenter', srchApply);
+srchQ.addEventListener('mouseleave', srchQueueClose);
+srchQ.addEventListener('input', srchRender);
+srchQ.addEventListener('blur', srchQueueClose);
+srchQ.addEventListener('keydown', e => { if (e.key === 'Escape') { srchPinned = false; srchQ.value = ''; srchQ.blur(); srchApply(); } });
 /* ---------------- Workout ---------------- */
 
 // Weights come from the derived "<Exercise> (wt)" columns in Notion, computed by
@@ -4035,7 +4330,7 @@ function wkSessions() {
 }
 
 function renderWorkout() {
-  const sess = wkSessions();
+  let sess = wkSessions();
   const names = [];
   /* Owner 8/15 ("you have to add leg press to this"): the legend lists every
      exercise EVER logged in this split, not just ones with a set inside the
@@ -4089,6 +4384,20 @@ function renderWorkout() {
     color: THEME.pastel[i % THEME.pastel.length],
     hidden: !!hidden[n]
   }));
+  /* Owner 9/9 ("weird gap on the left with the 90 day view"): an edge session
+     whose lifts are all X'd out (06/11 held only Paused Incline Press, off by
+     default) kept the axis open with dead space. Trim leading/trailing
+     sessions with no visible value. Middle sessions always stay (calendar-
+     true spacing is the 8/15 rule), and an edge day comes back the moment
+     its lift is un-hidden, since this re-runs on every legend toggle. */
+  const visAt = i => series.some(sr => !sr.hidden && sr.values[i] !== null && sr.values[i] !== undefined);
+  let lo = 0, hi = sess.length - 1;
+  while (lo < sess.length && !visAt(lo)) lo++;
+  while (hi >= lo && !visAt(hi)) hi--;
+  if (lo > 0 || hi < sess.length - 1) {
+    sess = sess.slice(lo, hi + 1);
+    series.forEach(sr => { sr.values = sr.values.slice(lo, hi + 1); });
+  }
   const host = document.getElementById('w');
   wkSvg.render(host, sess, names, series, (sidx, nidx) => {
     const hit = wkResolveClick(sess, sidx, names[nidx]);
@@ -5012,6 +5321,8 @@ function applyCustom() {
   renderWorkout();
 }
 custNum.addEventListener('input', applyCustom);
+// Owner 8/26: Enter applies and drops the keyboard (mobile).
+custNum.addEventListener('keydown', e => { if (e.key === 'Enter') { applyCustom(); custNum.blur(); } });
 custUnit.addEventListener('change', applyCustom);
 
 document.querySelectorAll('#wseg button').forEach(b => b.addEventListener('click', () => {
@@ -5084,6 +5395,7 @@ async function poll() {
       const short = ITEMS.__short;
       ITEMS = j.items; if (short) ITEMS.__short = short;
       render(currentW);
+      srchRender();
     }
   } catch (e) {}
   try {
@@ -5173,6 +5485,235 @@ if (document.fonts && document.fonts.ready) {
   document.fonts.ready.then(() => { SVGCharts.clearMeasureCache(); if (chart) chart.resize(true); if (wchart) wchart.resize(); if (wkSvg) wkSvg.sync(); });
 }
 
+/* ---------------------- Apple Health cards ---------------------- */
+let HSNAP = window.__D.hsnap;
+let HFULL = !HSNAP.partial;      // do we already hold the whole history?
+let hLoading = false;
+const HCARDS = [
+  { id: 'body', title: 'Body', note: 'Wyze Scale X',
+    series: ['BodyMass', 'LeanBodyMass', 'BodyFatPercentage', 'BodyMassIndex'],
+    on: ['BodyMass', 'BodyFatPercentage'] },
+  { id: 'activity', title: 'Activity', note: 'iPhone and Watch, one source per day so nothing double counts',
+    series: ['StepCount', 'DistanceWalkingRunning', 'FlightsClimbed', 'AppleExerciseTime', 'ActiveEnergyBurned', 'BasalEnergyBurned'],
+    on: ['StepCount', 'ActiveEnergyBurned'] },
+  { id: 'heart', title: 'Heart',
+    series: ['RestingHeartRate', 'WalkingHeartRateAverage', 'HeartRateVariabilitySDNN', 'VO2Max'],
+    on: ['RestingHeartRate', 'HeartRateVariabilitySDNN'] },
+  { id: 'sleep', title: 'Sleep', note: 'hours per night by stage', kind: 'sleep' },
+  { id: 'workouts', title: 'Workouts', kind: 'workouts' },
+  { id: 'other', title: 'Everything else', note: 'the long tail of what Health holds', kind: 'rest' }
+];
+const HLABELS = {
+  BodyMass: 'Weight (lb)', LeanBodyMass: 'Lean mass (lb)', BodyFatPercentage: 'Body fat (%)', BodyMassIndex: 'BMI',
+  StepCount: 'Steps', DistanceWalkingRunning: 'Walk + run (mi)', FlightsClimbed: 'Flights',
+  AppleExerciseTime: 'Exercise (min)', ActiveEnergyBurned: 'Active energy (kcal)', BasalEnergyBurned: 'Resting energy (kcal)',
+  RestingHeartRate: 'Resting HR', WalkingHeartRateAverage: 'Walking HR avg', HeartRateVariabilitySDNN: 'HRV (ms)', VO2Max: 'VO2 max'
+};
+const hLabel = k => HLABELS[k] || k.replace(/([a-z])([A-Z])/g, '$1 $2');
+const HVIS = {};
+let HCHARTS = [], hW = 90, hMode = 'raw';
+const hBox = {
+  id: 'hBox',
+  afterDatasetsDraw(c) {
+    const { ctx, chartArea: a } = c;
+    ctx.save(); ctx.strokeStyle = GRID; ctx.lineWidth = 1;
+    ctx.strokeRect(a.left + 0.5, a.top + 0.5, a.right - a.left - 1, a.bottom - a.top - 1);
+    ctx.restore();
+  }
+};
+function hDays() {
+  const d = HSNAP.days || [];
+  return hW ? d.slice(Math.max(0, d.length - hW)) : d;
+}
+function hShape(vals) {
+  if (hMode === 'raw') return vals;
+  if (hMode === 'avg') {
+    const nums = vals.filter(v => v !== null && v !== undefined);
+    const m = nums.length ? nums.reduce((a, b) => a + b, 0) / nums.length : null;
+    return vals.map(v => (v === null || v === undefined) ? null : m);
+  }
+  const out = [];
+  for (let i = 0; i < vals.length; i++) {
+    let s = 0, n = 0;
+    for (let j = Math.max(0, i - 6); j <= i; j++) { const v = vals[j]; if (v !== null && v !== undefined) { s += v; n++; } }
+    out.push(n ? s / n : null);
+  }
+  return out;
+}
+function hVals(key, days) {
+  const s = HSNAP.series[key];
+  if (!s) return days.map(() => null);
+  const m = new Map(s.points);
+  return days.map(d => m.has(d) ? m.get(d) : null);
+}
+function hAxisTicks() { return Object.assign(tickCfg(), { maxTicksLimit: 6 }); }
+function hXScale(days) {
+  return { grid: { display: false }, border: { color: AXIS },
+           ticks: Object.assign(tickCfg(), { maxTicksLimit: 6, maxRotation: 0, callback: (v, i) => fmt(days[i]) }) };
+}
+function hLine(el, card, keys, days) {
+  const shown = keys.filter(k => HVIS[card.id].has(k));
+  const wrap = document.createElement('div'); wrap.className = 'wrap'; el.appendChild(wrap);
+  if (!shown.length) { wrap.innerHTML = '<div class="empty">every series here is switched off</div>'; return; }
+  const cv = document.createElement('canvas'); wrap.appendChild(cv);
+  const units = [];
+  shown.forEach(k => { const u = HSNAP.series[k].unit; if (units.indexOf(u) < 0) units.push(u); });
+  const axisOf = {};
+  units.forEach((u, i) => { axisOf[u] = i === 0 ? 'y' : (i < 3 ? 'y' + i : 'y'); });
+  const o = baseOptions();
+  o.plugins.tooltip.callbacks = { title: it => fmt(days[it[0].dataIndex]) };
+  o.scales.x = hXScale(days);
+  Object.keys(axisOf).forEach(u => {
+    const id = axisOf[u];
+    if (o.scales[id]) return;
+    o.scales[id] = { position: id === 'y' ? 'left' : 'right',
+      grid: id === 'y' ? gridY() : { display: false }, border: { display: false },
+      title: { display: true, text: u, color: TICK, font: { size: 10, family: THEME.font } },
+      ticks: hAxisTicks() };
+  });
+  const ds = shown.map(k => {
+    const color = THEME.pastel[keys.indexOf(k) % THEME.pastel.length];
+    const data = hShape(hVals(k, days));
+    // One or two readings draw no line, so the card looks empty unless the
+    // points themselves are visible.
+    let n = 0; data.forEach(v => { if (v !== null && v !== undefined) n++; });
+    return { label: hLabel(k), data: data, borderColor: color, backgroundColor: color,
+             yAxisID: axisOf[HSNAP.series[k].unit], borderWidth: 2, pointRadius: n <= 2 ? 3 : 0, pointHoverRadius: 3,
+             tension: 0.25, spanGaps: true };
+  });
+  if (ds.some(d => d.pointRadius > 0)) o.scales.x.offset = true;
+  HCHARTS.push(new Chart(cv.getContext('2d'), { type: 'line', data: { labels: days, datasets: ds }, options: o, plugins: [hBox, crispCanvas] }));
+}
+function hSleep(el, days) {
+  const by = new Map((HSNAP.sleep || []).map(s => [s.day, s]));
+  const wrap = document.createElement('div'); wrap.className = 'wrap'; el.appendChild(wrap);
+  if (!days.some(d => by.has(d))) { wrap.innerHTML = '<div class="empty">no sleep data in this range</div>'; return; }
+  const cv = document.createElement('canvas'); wrap.appendChild(cv);
+  const stages = [['deep', 'Deep', '#7ba6ee'], ['core', 'Core', '#b193de'], ['rem', 'REM', '#ec8c8c'], ['awake', 'Awake', '#c9ced6']];
+  const o = baseOptions();
+  o.plugins.tooltip.callbacks = { title: it => fmt(days[it[0].dataIndex]) };
+  if (isDesktop()) {
+    o.onHover = (ev, els) => { ev.native.target.style.cursor = els && els.length ? 'pointer' : 'default'; };
+  }
+  o.onClick = (ev, els, ch) => {
+    if (suppressBlowClick) { suppressBlowClick = false; return; }
+    if (!els || !els.length) return;
+    const d = days[els[0].index];
+    if (d) openSleepBlow(ch.canvas, d, false);
+  };
+  cv.__blowRetarget = (di, idx) => { const d = days[idx]; if (d) openSleepBlow(cv, d, false); };
+  o.scales.x = Object.assign(hXScale(days), { stacked: true });
+  o.scales.y = { stacked: true, grid: gridY(), border: { display: false },
+    title: { display: true, text: 'hours', color: TICK, font: { size: 10, family: THEME.font } }, ticks: hAxisTicks() };
+  const ds = stages.map(s => ({ label: s[1], stack: 'h', backgroundColor: s[2], borderWidth: 0,
+    data: hShape(days.map(d => { const v = by.get(d); return v && v[s[0]] != null ? v[s[0]] / 60 : null; })) }));
+  HCHARTS.push(new Chart(cv.getContext('2d'), { type: 'bar', data: { labels: days, datasets: ds }, options: o, plugins: [crispCanvas] }));
+  const leg = document.createElement('div'); leg.className = 'legend'; el.appendChild(leg);
+  drawLegend(leg, stages.map(s => ({ label: s[1], color: s[2] })));
+}
+function hWorkouts(el, days) {
+  const inR = (HSNAP.workouts || []).filter(x => days.indexOf(x.day) >= 0);
+  const wrap = document.createElement('div'); wrap.className = 'wrap'; el.appendChild(wrap);
+  if (!inR.length) { wrap.innerHTML = '<div class="empty">no workouts in this range</div>'; return; }
+  const cv = document.createElement('canvas'); wrap.appendChild(cv);
+  const mins = new Map(), kcal = new Map();
+  inR.forEach(x => {
+    mins.set(x.day, (mins.get(x.day) || 0) + (x.duration_min || 0));
+    kcal.set(x.day, (kcal.get(x.day) || 0) + (x.energy_kcal || 0));
+  });
+  const o = baseOptions();
+  o.plugins.tooltip.callbacks = { title: it => fmt(days[it[0].dataIndex]) };
+  o.scales.x = hXScale(days);
+  o.scales.y = { position: 'left', grid: gridY(), border: { display: false },
+    title: { display: true, text: 'min', color: TICK, font: { size: 10, family: THEME.font } }, ticks: hAxisTicks() };
+  o.scales.y1 = { position: 'right', grid: { display: false }, border: { display: false },
+    title: { display: true, text: 'kcal', color: TICK, font: { size: 10, family: THEME.font } }, ticks: hAxisTicks() };
+  const ds = [
+    { type: 'bar', label: 'Minutes', yAxisID: 'y', backgroundColor: '#63bd93', borderWidth: 0,
+      data: hShape(days.map(d => mins.has(d) ? mins.get(d) : null)) },
+    { type: 'line', label: 'Energy (kcal)', yAxisID: 'y1', borderColor: '#f0a468', backgroundColor: '#f0a468',
+      borderWidth: 2, pointRadius: 0, tension: 0.25, spanGaps: true,
+      data: hShape(days.map(d => kcal.has(d) ? kcal.get(d) : null)) }
+  ];
+  HCHARTS.push(new Chart(cv.getContext('2d'), { type: 'bar', data: { labels: days, datasets: ds }, options: o, plugins: [hBox, crispCanvas] }));
+  const leg = document.createElement('div'); leg.className = 'legend'; el.appendChild(leg);
+  drawLegend(leg, [{ label: 'Minutes', color: '#63bd93' }, { label: 'Energy (kcal)', color: '#f0a468' }]);
+  const rows = inR.slice().sort((a, b) => a.day < b.day ? 1 : -1).slice(0, 50).map(x =>
+    '<tr><td>' + fmt(x.day) + '</td><td>' + (x.type || '') + '</td><td>' +
+    (x.duration_min != null ? Math.round(x.duration_min) : '') + '</td><td>' +
+    (x.distance_km != null ? Number(x.distance_km).toFixed(2) : '') + '</td><td>' +
+    (x.energy_kcal != null ? Math.round(x.energy_kcal) : '') + '</td><td>' +
+    (x.avg_hr != null ? Math.round(x.avg_hr) : '') + '</td></tr>').join('');
+  el.insertAdjacentHTML('beforeend', '<div class="hscroll"><table><thead><tr><th>day</th><th>type</th><th>min</th>' +
+    '<th>mi</th><th>kcal</th><th>avg hr</th></tr></thead><tbody>' + rows + '</tbody></table></div>');
+}
+function hRender() {
+  const host = document.getElementById('hcards');
+  if (!host) return;
+  const sec = document.getElementById('hsec');
+  if (!HSNAP.days || !HSNAP.days.length) {
+    if (sec) sec.style.display = 'none';
+    return;
+  }
+  HCHARTS.splice(0).forEach(c => c.destroy());
+  host.innerHTML = '';
+  const days = hDays();
+  const claimed = new Set(HCARDS.reduce((a, c) => a.concat(c.series || []), []));
+  HCARDS.forEach(card => {
+    let keys = card.series || [];
+    if (card.kind === 'rest') keys = Object.keys(HSNAP.series).filter(k => !claimed.has(k)).sort();
+    const el = document.createElement('div');
+    el.className = 'hcard';
+    el.innerHTML = '<span class="htitle">' + card.title + '</span>' + (card.note ? '<div class="hnote">' + card.note + '</div>' : '');
+    host.appendChild(el);
+    if (card.kind === 'sleep') return hSleep(el, days);
+    if (card.kind === 'workouts') return hWorkouts(el, days);
+    const present = keys.filter(k => HSNAP.series[k]);
+    if (!present.length) {
+      el.insertAdjacentHTML('beforeend', '<div class="wrap"><div class="empty">nothing in Health for this group yet</div></div>');
+      return;
+    }
+    if (!HVIS[card.id]) {
+      const dflt = (card.on || []).filter(k => present.indexOf(k) >= 0);
+      HVIS[card.id] = new Set(dflt.length ? dflt : present.slice(0, 2));
+    }
+    hLine(el, card, present, days);
+    const leg = document.createElement('div'); leg.className = 'legend'; el.appendChild(leg);
+    drawLegend(leg, present.map(k => ({ label: hLabel(k), color: THEME.pastel[present.indexOf(k) % THEME.pastel.length], off: !HVIS[card.id].has(k) })),
+      (lbl) => {
+        const k = present.filter(x => hLabel(x) === lbl)[0];
+        if (HVIS[card.id].has(k)) HVIS[card.id].delete(k); else HVIS[card.id].add(k);
+        hRender();
+      });
+  });
+}
+// Only Year and All time need history the page didn't inline; that fetch happens
+// once, off the first-paint path.
+async function hEnsureFull() {
+  if (HFULL || hLoading) return;
+  hLoading = true;
+  try {
+    const r = await gateFetch('/health/data.json');
+    if (r.ok) { const j = await r.json(); if (j && j.snap) { HSNAP = j.snap; HFULL = true; } }
+  } catch (e) {} finally { hLoading = false; }
+}
+function hSegs() {
+  const md = document.getElementById('hmode'), rg = document.getElementById('hseg');
+  if (!md || !rg) return;
+  md.querySelectorAll('button').forEach(b => b.classList.toggle('on', b.dataset.m === hMode));
+  rg.querySelectorAll('button').forEach(b => b.classList.toggle('on', Number(b.dataset.w) === hW));
+  md.onclick = e => { const b = e.target.closest('button'); if (!b) return; hMode = b.dataset.m; hSegs(); hRender(); };
+  rg.onclick = async e => {
+    const b = e.target.closest('button'); if (!b) return;
+    hW = Number(b.dataset.w); hSegs();
+    if ((hW === 0 || hW > (HSNAP.days || []).length) && !HFULL) { await hEnsureFull(); }
+    hRender();
+  };
+}
+hSegs();
+hRender();
+window.addEventListener('resize', () => { HCHARTS.forEach(c => c.resize()); });
+
 `;
 function appVer() {
   let h = 5381;
@@ -5181,7 +5722,7 @@ function appVer() {
 }
 const APP_VER = appVer();
 
-function chartPage(rows, meta, wk, token, ek, goals, items) {
+function chartPage(rows, meta, wk, token, ek, goals, hsnap, items) {
   return `<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>cbum chart</title>
@@ -5189,11 +5730,12 @@ function chartPage(rows, meta, wk, token, ek, goals, items) {
 <link rel="preconnect" href="https://app.notion.com"><link rel="dns-prefetch" href="https://app.notion.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="preload" as="style" onload="this.onload=null;this.rel='stylesheet'"><noscript><link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet"></noscript>
 
-<style>${CSS}</style></head>
+<style>${CSS}${HEALTH_CSS}</style></head>
 <body>
 <div class="card">
   <div class="head">
     <span class="title">Macros</span>
+    <button class="sicn" id="msrchbtn" type="button" aria-label="Search logged items"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.8"></circle><line x1="15.6" y1="15.6" x2="21" y2="21"></line></svg></button>
     <span class="seg" id="mgrp">
       <button data-g="core">Core</button><button data-g="detail">Detail</button><button data-g="all">All</button>
     </span>
@@ -5201,9 +5743,10 @@ function chartPage(rows, meta, wk, token, ek, goals, items) {
       <button data-m="raw">Raw</button><button data-ms="opaque">Opaque</button><button data-ms="transparent">Clear</button>
     </span>
     <span class="seg" id="mseg">
-      <button data-w="3">3 day</button><button data-w="7">7 day</button><button data-w="0">All time</button><button data-avg="1">Average</button>
+      <button data-w="3">3 day</button><button data-w="7">7 day</button><button data-w="0">All</button><button data-avg="1">Average</button>
     </span>
   </div>
+  <div class="srchres" id="msrchres" hidden></div>
   <div class="legend" id="mlegend"></div>
   <div class="wrap"><div id="c" class="svghost"></div></div>
   <div class="foot" style="margin-top:8px"><a id="goalslink" href="/goals">Edit macro goals</a></div>
@@ -5219,7 +5762,7 @@ function chartPage(rows, meta, wk, token, ek, goals, items) {
       <button data-f="opaque">Opaque</button><button data-f="line">Line</button>
     </span>
     <span class="seg" id="wseg">
-      <button data-w="30">Month</button><button data-w="90">90 day</button><button data-w="0">All time</button><button data-w="custom">Custom</button>
+      <button data-w="30">Month</button><button data-w="90">90 day</button><button data-w="0">All</button><button data-w="custom">Custom</button>
     </span>
   </div>
   <div class="row2" id="wrow2">
@@ -5256,7 +5799,7 @@ window.addEventListener('error', e => chartFail('Chart failed to load on this de
 
 <\/script>
 <script>
-window.__D = ${JSON.stringify({ gateToken: token || "", embedK: ek || "", ver: MEM.rowsSig || MEM.wkSig ? version() : "", rows, dayPages: DAY_PAGES, meta, wkSplits: wk && wk.splits ? wk.splits : {}, wkErrors: wk && wk.errors ? wk.errors : {}, wkOrder: wk && wk.order ? wk.order : {}, items: items || {}, calTarget: CAL_TARGET, proTarget: PRO_TARGET, goals: goals || {}, goalFields: GOAL_FIELDS })};
+window.__D = ${JSON.stringify({ gateToken: token || "", embedK: ek || "", ver: MEM.rowsSig || MEM.wkSig ? version() : "", rows, dayPages: DAY_PAGES, meta, wkSplits: wk && wk.splits ? wk.splits : {}, wkErrors: wk && wk.errors ? wk.errors : {}, wkOrder: wk && wk.order ? wk.order : {}, items: items || {}, calTarget: CAL_TARGET, proTarget: PRO_TARGET, goals: goals || {}, goalFields: GOAL_FIELDS, hsnap: hsnap || { days: [], series: {}, sleep: [], workouts: [], partial: false } })};
 <\/script>
 <script src="/app.js?v=${APP_VER}"><\/script>
 </body></html>`;
@@ -5320,6 +5863,3692 @@ if (window.top !== window.self) {
 
 const htmlHeaders = { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" };
 
+/* ---------------------------------------------------------------------------
+   Apple Health: D1-backed daily aggregates, Shortcuts ingest, /health page.
+   Storage: D1 binding HEALTH_DB. Snapshot cache: KV key health_snap_v1.
+   Ingest auth: X-Health-Key header vs the HEALTH_INGEST_KEY secret, checked
+   above the device-cookie gate because the Shortcut cannot hold a cookie.
+--------------------------------------------------------------------------- */
+const HEALTH_SNAP_KEY = "health_snap_v1";
+const HEALTH_MAX_SNAP_AGE_MS = 60 * 1000;
+const HMEM = { snap: null, at: 0, refreshing: false };
+
+// Shortcut field -> [metric, unit, conversion]
+const SHORTCUT_FIELDS = {
+  steps:        ["StepCount", "count", v => v],
+  active_kcal:  ["ActiveEnergyBurned", "kcal", v => v],
+  resting_kcal: ["BasalEnergyBurned", "kcal", v => v],
+  exercise_min: ["AppleExerciseTime", "min", v => v],
+  flights:      ["FlightsClimbed", "count", v => v],
+  distance_km:  ["DistanceWalkingRunning", "km", v => v],
+  distance_mi:  ["DistanceWalkingRunning", "km", v => v * 1.609344],
+  weight_kg:    ["BodyMass", "kg", v => v],
+  weight_lb:    ["BodyMass", "kg", v => v * 0.45359237],
+  lean_kg:      ["LeanBodyMass", "kg", v => v],
+  lean_lb:      ["LeanBodyMass", "kg", v => v * 0.45359237],
+  bodyfat_pct:  ["BodyFatPercentage", "%", v => (v > 0 && v <= 1 ? v * 100 : v)],
+  bmi:          ["BodyMassIndex", "count", v => v],
+  heart_rate:   ["HeartRate", "count/min", v => v],
+  resting_hr:   ["RestingHeartRate", "count/min", v => v],
+  walking_hr:   ["WalkingHeartRateAverage", "count/min", v => v],
+  hrv_ms:       ["HeartRateVariabilitySDNN", "ms", v => v],
+  vo2max:       ["VO2Max", "mL/min\u00b7kg", v => v],
+};
+
+const HEALTH_SCHEMA = [
+  `CREATE TABLE IF NOT EXISTS metric_daily (
+     metric TEXT NOT NULL, day TEXT NOT NULL, unit TEXT,
+     value REAL, mn REAL, mx REAL, cnt INTEGER, src TEXT,
+     updated_at INTEGER, PRIMARY KEY (metric, day))`,
+  `CREATE INDEX IF NOT EXISTS idx_metric_daily_day ON metric_daily(day)`,
+  `CREATE TABLE IF NOT EXISTS sleep_daily (
+     day TEXT PRIMARY KEY, core REAL, deep REAL, rem REAL, awake REAL,
+     in_bed REAL, updated_at INTEGER)`,
+  `CREATE TABLE IF NOT EXISTS workouts (
+     id TEXT PRIMARY KEY, day TEXT, type TEXT, duration_min REAL,
+     distance_km REAL, energy_kcal REAL, avg_hr REAL, source TEXT)`,
+  `CREATE INDEX IF NOT EXISTS idx_workouts_day ON workouts(day)`,
+  // Full-resolution samples for metrics where intra-day detail is worth keeping.
+  // ts is the sample start in epoch ms; the (metric, ts) PK makes a re-post of
+  // the same sample a no-op instead of a duplicate.
+  // Identity is (metric, start, end, source). Two devices can write the same
+  // metric at the same instant - an iPhone and a Watch both logging steps - so
+  // (metric, ts) alone would silently drop one of them. HealthKit's own sample
+  // UUID is not exposed to Shortcuts (Get Details of Health Sample offers only
+  // Type, Value, Unit, Start Date, End Date, Duration, Source, Name), so this
+  // four-part natural key is the strongest identity reachable from the phone.
+  // Re-reading the same sample overwrites in place; a corrected value replaces
+  // the old one rather than accumulating.
+  `CREATE TABLE IF NOT EXISTS hsample (
+     metric TEXT NOT NULL, ts INTEGER NOT NULL, end_ts INTEGER NOT NULL,
+     src TEXT NOT NULL, day TEXT NOT NULL, unit TEXT, value REAL, txt TEXT,
+     PRIMARY KEY (metric, ts, end_ts, src))`,
+  // Category samples (symptoms, events, stand hours, test results) carry a word
+  // rather than a number, and that word is the datapoint. Added after the table
+  // shipped, so existing databases get it by ALTER; the error when it is already
+  // there is expected and ignored.
+  `ALTER TABLE hsample ADD COLUMN txt TEXT`,
+  `CREATE INDEX IF NOT EXISTS idx_hsample_metric_day ON hsample(metric, day)`,
+  // The first-cut table only ever existed empty; nothing has posted samples yet.
+  `DROP TABLE IF EXISTS sample`,
+];
+
+let HEALTH_INIT_DONE = false;
+async function healthInit(env) {
+  // Once per isolate. Re-running the schema on every request was cheap when it
+  // was four CREATE IF NOT EXISTS statements; it is wasted D1 round-trips now,
+  // and it re-issues the one-time DROP on every read.
+  if (HEALTH_INIT_DONE) return;
+  for (const stmt of HEALTH_SCHEMA) {
+    // ALTER is the one statement with no IF NOT EXISTS form: on a database that
+    // already has the column it fails, and that failure is the success case.
+    if (/^ALTER TABLE/i.test(stmt)) {
+      try { await env.HEALTH_DB.prepare(stmt).run(); } catch (e) {}
+      continue;
+    }
+    await env.HEALTH_DB.prepare(stmt).run();
+  }
+  HEALTH_INIT_DONE = true;
+}
+
+function laToday() {
+  // The phone lives in Owner's local day; the Worker runs in UTC.
+  return new Date().toLocaleDateString("en-CA", { timeZone: "America/Los_Angeles" });
+}
+
+// One row per metric-day. Re-posting the same day overwrites it, so a Shortcut
+// that fires hourly just keeps correcting today's partial totals.
+function metricUpsert(env, r) {
+  return env.HEALTH_DB.prepare(
+    `INSERT INTO metric_daily (metric, day, unit, value, mn, mx, cnt, src, updated_at)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+     ON CONFLICT(metric, day) DO UPDATE SET
+       unit=excluded.unit, value=excluded.value, mn=excluded.mn, mx=excluded.mx,
+       cnt=excluded.cnt, src=excluded.src, updated_at=excluded.updated_at`
+  ).bind(r.metric, r.day, r.unit || null, r.value, r.mn ?? null, r.mx ?? null,
+         r.cnt ?? null, r.src || "shortcut", Date.now());
+}
+
+function sleepUpsert(env, s) {
+  return env.HEALTH_DB.prepare(
+    `INSERT INTO sleep_daily (day, core, deep, rem, awake, in_bed, updated_at)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+     ON CONFLICT(day) DO UPDATE SET core=excluded.core, deep=excluded.deep,
+       rem=excluded.rem, awake=excluded.awake, in_bed=excluded.in_bed,
+       updated_at=excluded.updated_at`
+  ).bind(s.day, s.core ?? null, s.deep ?? null, s.rem ?? null, s.awake ?? null,
+         s.in_bed ?? null, Date.now());
+}
+
+function workoutUpsert(env, w) {
+  // start+type is stable across re-posts of the same session, so replays are free.
+  const id = w.id || `${w.start || w.day}|${w.type || "?"}`;
+  return env.HEALTH_DB.prepare(
+    `INSERT INTO workouts (id, day, type, duration_min, distance_km, energy_kcal, avg_hr, source)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+     ON CONFLICT(id) DO UPDATE SET day=excluded.day, type=excluded.type,
+       duration_min=excluded.duration_min, distance_km=excluded.distance_km,
+       energy_kcal=excluded.energy_kcal, avg_hr=excluded.avg_hr, source=excluded.source`
+  ).bind(id, w.day, w.type || null, w.duration_min ?? null, w.distance_km ?? null,
+         w.energy_kcal ?? null, w.avg_hr ?? null, w.source || "export");
+}
+
+
+// Shortcuts hands back dates as display text, e.g. "August 13, 2026 at 1:23 PM"
+// or "13/08/2026, 13:23". Date.parse chokes on the " at " form, so normalize
+// before giving up.
+const HEALTH_TZ = "America/Los_Angeles";
+
+// Zone-less date text ("August 13, 2026 at 1:23 PM") is the user's wall clock,
+// but Workers run in UTC, so Date.parse would read it as UTC and shift the sample
+// by seven or eight hours - enough to land a late-evening reading on the wrong
+// day. Resolve it against the user's zone instead, two-pass so DST is handled.
+function zoneOffsetMinutes(ms, tz) {
+  const dtf = new Intl.DateTimeFormat("en-US", {
+    timeZone: tz, hour12: false, year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit",
+  });
+  const p = {};
+  for (const part of dtf.formatToParts(new Date(ms))) p[part.type] = part.value;
+  const asUTC = Date.UTC(+p.year, +p.month - 1, +p.day, +p.hour % 24, +p.minute, +p.second);
+  return (asUTC - ms) / 60000;
+}
+
+function parseWallClock(str, tz) {
+  // A bare ISO string ("2026-08-13T13:25:00") is also wall-clock text with no
+  // zone, but Date.parse rejects it once " GMT+0000" is appended, so swap the
+  // T for a space first and let the same offset resolution handle it.
+  const norm = /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}/.test(str)
+    ? str.replace("T", " ").replace(/\.\d+$/, "")
+    : str;
+  const guess = Date.parse(norm + " GMT+0000");
+  if (!isFinite(guess)) return NaN;
+  let off = zoneOffsetMinutes(guess, tz);
+  let ms = guess - off * 60000;
+  const off2 = zoneOffsetMinutes(ms, tz);
+  if (off2 !== off) ms = guess - off2 * 60000;
+  return ms;
+}
+
+// Anything outside this range is a misparse, not a reading: Health did not
+// record a step count in 1999, and a phone does not report next month. Without
+// this, a date string the parser cannot read lands as the year 2000 - a row
+// that looks like data and is not.
+const TS_MIN = Date.UTC(2005, 0, 1);
+function tsSane(ms) { return isFinite(ms) && ms > TS_MIN && ms < Date.now() + 3 * 86400000; }
+
+function parseSampleTs(t) {
+  if (typeof t === "number" && isFinite(t)) return t;
+  const str = String(t || "").trim();
+  if (!str) return NaN;
+  const zoned = /(Z|[+-]\d{2}:?\d{2}|GMT|UTC|[A-Z]{3,4}T)$/.test(str);
+  const clean = str.replace(/\s+at\s+/i, " ").replace(/\u202f/g, " ").replace(/,/g, "");
+  if (zoned) {
+    const ms = Date.parse(str);
+    return isFinite(ms) ? ms : Date.parse(clean);
+  }
+  const ms = parseWallClock(clean, HEALTH_TZ);
+  if (isFinite(ms)) return ms;
+  return Date.parse(clean);
+}
+
+function sampleUpsert(env, s) {
+  // end defaults to start for instantaneous samples, source to "unknown" so the
+  // key never contains a null and dedupe stays deterministic.
+  const end = Number.isFinite(s.end_ts) ? s.end_ts : s.ts;
+  return env.HEALTH_DB.prepare(
+    `INSERT INTO hsample (metric, ts, end_ts, src, day, unit, value, txt)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+     ON CONFLICT(metric, ts, end_ts, src) DO UPDATE SET
+       day=excluded.day, unit=excluded.unit, value=excluded.value, txt=excluded.txt`
+  ).bind(s.metric, s.ts, end, s.src || "unknown", s.day, s.unit || null,
+         s.value === undefined ? null : s.value, s.txt || null);
+}
+
+// The phone reports whatever unit Owner's Health app displays, which for a US
+// phone means pounds, miles, feet and Fahrenheit. Storage stays SI, so anything
+// that arrives in a customary unit is converted once here, on the way in. Keyed
+// by the unit string rather than by metric name, so a metric this Worker has
+// never seen still lands in the right unit.
+const UNIT_IN = {
+  lb: ["kg", v => v * 0.45359237], lbs: ["kg", v => v * 0.45359237],
+  pound: ["kg", v => v * 0.45359237], pounds: ["kg", v => v * 0.45359237],
+  st: ["kg", v => v * 6.35029318], stones: ["kg", v => v * 6.35029318],
+  oz: ["g", v => v * 28.349523125], ounces: ["g", v => v * 28.349523125],
+  mi: ["km", v => v * 1.609344], mile: ["km", v => v * 1.609344], miles: ["km", v => v * 1.609344],
+  yd: ["m", v => v * 0.9144], ft: ["m", v => v * 0.3048], feet: ["m", v => v * 0.3048],
+  in: ["cm", v => v * 2.54], inches: ["cm", v => v * 2.54],
+  degf: ["degC", v => (v - 32) / 1.8], "°f": ["degC", v => (v - 32) / 1.8],
+  f: ["degC", v => (v - 32) / 1.8],
+  mph: ["m/s", v => v * 0.44704], "mi/hr": ["m/s", v => v * 0.44704],
+  "fl oz": ["mL", v => v * 29.5735295625], floz: ["mL", v => v * 29.5735295625],
+  cup: ["mL", v => v * 236.5882365], cups: ["mL", v => v * 236.5882365],
+  gal: ["L", v => v * 3.785411784], qt: ["L", v => v * 0.946352946],
+  cal: ["kcal", v => v], Cal: ["kcal", v => v],
+};
+function normalizeIn(value, unit) {
+  if (unit === null || unit === undefined || unit === "") return { value, unit: unit || null };
+  const key = String(unit).trim().toLowerCase();
+  const hit = UNIT_IN[key];
+  if (!hit) return { value, unit: String(unit).trim() };
+  return { value: hit[1](value), unit: hit[0] };
+}
+
+// A workout line off the phone carries display strings: "1:02:33" for duration,
+// "3.24 mi" for distance, "412 kcal" for energy. Parse defensively - a field
+// that does not parse is left null rather than guessed at.
+function durToMinutes(v) {
+  if (v === null || v === undefined || v === "") return null;
+  const str = String(v).trim();
+  if (/^\d+(\.\d+)?$/.test(str)) return Number(str);          // already minutes
+  const parts = str.split(":").map(Number);
+  if (parts.some(n => !isFinite(n))) return null;
+  if (parts.length === 3) return parts[0] * 60 + parts[1] + parts[2] / 60;
+  if (parts.length === 2) return parts[0] + parts[1] / 60;
+  return null;
+}
+function valueWithUnit(v) {
+  if (v === null || v === undefined || v === "") return null;
+  const m = String(v).trim().match(/^(-?[\d.,]+)\s*([A-Za-z°/ ]*)$/);
+  if (!m) return null;
+  const n = Number(m[1].replace(/,/g, ""));
+  if (!isFinite(n)) return null;
+  return { value: n, unit: (m[2] || "").trim() || null };
+}
+function shortcutWorkout(o) {
+  const start = o.start ? parseSampleTs(o.start) : NaN;
+  if (!tsSane(start)) return null;
+  const day = new Date(start).toLocaleDateString("en-CA", { timeZone: HEALTH_TZ });
+  const dist = valueWithUnit(o.distance);
+  let km = null;
+  if (dist) { const n = normalizeIn(dist.value, dist.unit); km = n.unit === "m" ? n.value / 1000 : n.value; }
+  const en = valueWithUnit(o.energy);
+  return {
+    id: new Date(start).toISOString() + "|" + (o.type || "?"),
+    day, type: o.type || null,
+    duration_min: durToMinutes(o.duration),
+    distance_km: km,
+    energy_kcal: en ? en.value : null,
+    avg_hr: numOrNull(o.avg_hr),
+    source: "shortcut",
+  };
+}
+
+const numOrNull = v => {
+  if (v === null || v === undefined || v === "") return null;
+  if (typeof v === "number") return isFinite(v) ? v : null;
+  // A category value is a word - "Medium", "In Bed", "Positive". Stripping the
+  // non-digits leaves nothing, and Number("") is 0, which would store every one
+  // of them as a zero reading. No digit means not a number.
+  const cleaned = String(v).replace(/[^0-9.\-]/g, "");
+  if (!/[0-9]/.test(cleaned)) return null;
+  const n = Number(cleaned);
+  return isFinite(n) ? n : null;
+};
+
+// The hourly Shortcut posts one flat object of today's numbers. Anything the
+// phone had no samples for arrives empty and is skipped rather than written as 0.
+async function healthIngestShortcut(env, body) {
+  const day = (body.date && String(body.date).slice(0, 10)) || laToday();
+  const stmts = [];
+  const wrote = [];
+  const badTs = [];
+  for (const [field, spec] of Object.entries(SHORTCUT_FIELDS)) {
+    const n = numOrNull(body[field]);
+    if (n === null) continue;
+    const [metric, unit, conv] = spec;
+    stmts.push(metricUpsert(env, { metric, day, unit, value: conv(n), src: "shortcut" }));
+    wrote.push(metric);
+  }
+  // Generic daily rows: [{metric, value, unit?, day?}]. The metric name travels
+  // with the data, so the Shortcut can send a metric this Worker has never been
+  // told about and it still lands. This is what makes the phone-side file final:
+  // adding a metric is a server decision, not a new .shortcut.
+  if (Array.isArray(body.daily) && body.daily.length) {
+    // The Shortcut asks for some metrics under more than one picker label,
+    // because only one of them exists on the device and we do not know which.
+    // The label that finds nothing sends an empty value, which is skipped here -
+    // an empty can never overwrite a real number. If two labels both return
+    // data, the first wins, and the Shortcut sends them most-confident first.
+    const seenDaily = new Set();
+    for (const r of body.daily) {
+      const v = numOrNull(r.value);
+      if (v === null || !r.metric) continue;
+      const dkey = r.metric + "|" + ((r.day && String(r.day).slice(0, 10)) || day);
+      if (seenDaily.has(dkey)) continue;
+      seenDaily.add(dkey);
+      const rday = (r.day && String(r.day).slice(0, 10)) || day;
+      const n2 = normalizeIn(v, r.unit);
+      stmts.push(metricUpsert(env, { metric: r.metric, day: rday, unit: n2.unit, value: n2.value, src: "shortcut" }));
+      wrote.push(r.metric);
+    }
+  }
+  // Full-resolution samples: [{metric, ts (ISO or epoch ms), value, unit, source}].
+  // Each is stored raw AND folded into today's daily aggregate, so the existing
+  // daily charts render unchanged while the raw detail is there for later.
+  if (Array.isArray(body.samples) && body.samples.length) {
+    const perMetric = {};
+    const sleepAcc = {};
+    const sleepSeen = new Set();
+    const catCount = {};
+    for (let s of body.samples) {
+      const metric = s.metric;
+      if (!metric) continue;
+      // Sleep arrives as one row per stage window with a word for a value
+      // ("Deep", "REM", "Awake"), so it is minutes-between-timestamps, not a
+      // number to average. Every run re-sends the whole night, so the day is
+      // rebuilt from scratch rather than added to.
+      if (metric === "SleepAnalysis" || metric === "Sleep") {
+        const a = parseSampleTs(s.ts), b = parseSampleTs(s.end);
+        if (!tsSane(a) || !tsSane(b) || b <= a) { badTs.push(String(s.ts).slice(0, 40)); continue; }
+        const dedupe = a + "|" + b + "|" + String(s.value || "");
+        if (sleepSeen.has(dedupe)) continue;
+        sleepSeen.add(dedupe);
+        const mins = (b - a) / 60000;
+        const stage = String(s.value || "").toLowerCase();
+        const bucket = stage.includes("deep") ? "deep"
+          : stage.includes("rem") ? "rem"
+          : stage.includes("awake") ? "awake"
+          : stage.includes("bed") ? "in_bed"
+          : "core";
+        // A night is credited to the day it ends on, which is the morning Owner
+        // wakes up in.
+        const sd = new Date(b).toLocaleDateString("en-CA", { timeZone: HEALTH_TZ });
+        const acc = sleepAcc[sd] || (sleepAcc[sd] = { day: sd });
+        acc[bucket] = (acc[bucket] || 0) + mins;
+        continue;
+      }
+      const raw = numOrNull(s.value);
+      if (raw === null) {
+        // A category log - a symptom, an event, a test result, a stand hour.
+        // The word IS the datapoint, so it is stored rather than dropped, and
+        // the day also gets a count so it can be charted like anything else.
+        const txt = String(s.value ?? "").trim();
+        if (!txt) continue;
+        const a = parseSampleTs(s.ts);
+        if (!tsSane(a)) { badTs.push(String(s.ts).slice(0, 40)); continue; }
+        const b2 = parseSampleTs(s.end);
+        const cday = s.day || new Date(a).toLocaleDateString("en-CA", { timeZone: HEALTH_TZ });
+        stmts.push(sampleUpsert(env, {
+          metric, ts: a, end_ts: Number.isFinite(b2) ? b2 : a, day: cday,
+          unit: null, value: null, txt, src: s.source || "shortcut",
+        }));
+        const ck = metric + "|" + cday;
+        catCount[ck] = catCount[ck] || { metric, day: cday, n: 0 };
+        catCount[ck].n += 1;
+        wrote.push(metric);
+        continue;
+      }
+      const norm = normalizeIn(raw, s.unit);
+      const v = norm.value;
+      s = { ...s, unit: norm.unit };
+      const ms = parseSampleTs(s.ts);
+      if (!tsSane(ms)) {
+        // The phone's date format is the one thing I cannot see from here, so a
+        // string the parser does not know is reported back with an example
+        // rather than silently dropped.
+        badTs.push(String(s.ts).slice(0, 40));
+        continue;
+      }
+      const sday = s.day || new Date(ms).toLocaleDateString("en-CA", { timeZone: HEALTH_TZ });
+      const et = s.end === undefined ? undefined : parseSampleTs(s.end);
+      stmts.push(sampleUpsert(env, {
+        metric, ts: ms, end_ts: Number.isFinite(et) ? et : ms, day: sday,
+        unit: s.unit, value: v, src: s.source || "shortcut",
+      }));
+      const key = metric + "|" + sday;
+      const g = perMetric[key] || (perMetric[key] = { metric, day: sday, unit: s.unit, sum: 0, cnt: 0, mn: v, mx: v, last: v, lastTs: ms });
+      g.sum += v; g.cnt += 1; g.mn = Math.min(g.mn, v); g.mx = Math.max(g.mx, v);
+      if (ms >= g.lastTs) { g.last = v; g.lastTs = ms; }
+      wrote.push(metric);
+    }
+    // A rollup here is a partial view of a day that may arrive in several posts;
+    // reconcileSampleDays rebuilds each touched day from the full sample table
+    // behind the response, so the aggregate is always the true daily figure.
+    body.__touched = Object.values(perMetric).map(g => ({ metric: g.metric, day: g.day }));
+    for (const c of Object.values(catCount)) {
+      stmts.push(metricUpsert(env, {
+        metric: c.metric + "Count", day: c.day, unit: "count", value: c.n,
+        cnt: c.n, src: "shortcut",
+      }));
+    }
+    for (const acc of Object.values(sleepAcc)) {
+      stmts.push(sleepUpsert(env, {
+        day: acc.day, core: acc.core ?? null, deep: acc.deep ?? null, rem: acc.rem ?? null,
+        awake: acc.awake ?? null, in_bed: acc.in_bed ?? null,
+      }));
+      wrote.push("Sleep");
+    }
+  }
+  // Workouts logged today, already parsed out of the phone's display strings.
+  if (Array.isArray(body.workouts) && body.workouts.length) {
+    for (const w of body.workouts) {
+      stmts.push(workoutUpsert(env, w));
+      wrote.push("Workout");
+    }
+  }
+  if (body.sleep && typeof body.sleep === "object") {
+    const s = body.sleep;
+    stmts.push(sleepUpsert(env, {
+      day, core: numOrNull(s.core), deep: numOrNull(s.deep), rem: numOrNull(s.rem),
+      awake: numOrNull(s.awake), in_bed: numOrNull(s.in_bed),
+    }));
+    wrote.push("Sleep");
+  }
+  const diag = {};
+  if (badTs.length) {
+    diag.unparsed_timestamps = badTs.length;
+    diag.unparsed_examples = [...new Set(badTs)].slice(0, 3);
+  }
+  if (body.__bad_lines) diag.unparsed_lines = body.__bad_lines;
+  if (!stmts.length) return { day, written: 0, metrics: [], ...diag };
+  // D1 takes one batch at a time, and a catch-up run can carry thousands of
+  // rows, so this goes up in chunks rather than as one oversized batch.
+  for (let i = 0; i < stmts.length; i += 100) await env.HEALTH_DB.batch(stmts.slice(i, i + 100));
+  return { day, written: stmts.length, metrics: [...new Set(wrote)], ...diag };
+}
+
+// Bulk path for the export.zip backfill: same tables, same upserts, batched.
+async function healthIngestBulk(env, body) {
+  const out = { metrics: 0, sleep: 0, workouts: 0 };
+  const chunks = [];
+  const push = (arr, fn) => {
+    for (let i = 0; i < arr.length; i += 100) chunks.push(arr.slice(i, i + 100).map(fn));
+  };
+  if (Array.isArray(body.metrics)) { push(body.metrics, r => metricUpsert(env, r)); out.metrics = body.metrics.length; }
+  if (Array.isArray(body.sleep)) { push(body.sleep, s => sleepUpsert(env, s)); out.sleep = body.sleep.length; }
+  if (Array.isArray(body.workouts)) { push(body.workouts, w => workoutUpsert(env, w)); out.workouts = body.workouts.length; }
+  if (Array.isArray(body.samples)) {
+    push(body.samples, s => {
+      const ms = parseSampleTs(s.ts);
+      const et = s.end === undefined ? ms : parseSampleTs(s.end);
+      return sampleUpsert(env, {
+        metric: s.metric, ts: ms, end_ts: Number.isFinite(et) ? et : ms, day: s.day,
+        unit: s.unit, value: s.value, src: s.source || "export",
+      });
+    });
+    out.samples = body.samples.length;
+  }
+  for (const c of chunks) await env.HEALTH_DB.batch(c);
+  return out;
+}
+
+async function buildHealthSnapshot(env) {
+  const [m, s, w] = await Promise.all([
+    env.HEALTH_DB.prepare("SELECT metric, day, unit, value FROM metric_daily ORDER BY day").all(),
+    env.HEALTH_DB.prepare("SELECT day, core, deep, rem, awake, in_bed FROM sleep_daily ORDER BY day").all(),
+    env.HEALTH_DB.prepare("SELECT day, type, duration_min, distance_km, energy_kcal, avg_hr FROM workouts ORDER BY day").all(),
+  ]);
+  const series = {};
+  const days = new Set();
+  for (const r of (m.results || [])) {
+    if (r.value === null) continue;
+    const e = series[r.metric] || (series[r.metric] = { unit: r.unit || "", points: [] });
+    e.points.push([r.day, Math.round(r.value * 1000) / 1000]);
+    days.add(r.day);
+  }
+  for (const r of (s.results || [])) days.add(r.day);
+  for (const r of (w.results || [])) days.add(r.day);
+  const dayList = [...days].sort();
+  // Dense day axis so gaps read as gaps instead of being compressed away.
+  const filled = [];
+  if (dayList.length) {
+    const d = new Date(dayList[0] + "T00:00:00Z");
+    const end = new Date(dayList[dayList.length - 1] + "T00:00:00Z");
+    while (d <= end) { filled.push(d.toISOString().slice(0, 10)); d.setUTCDate(d.getUTCDate() + 1); }
+  }
+  return {
+    generated_at: new Date().toISOString(),
+    days: filled,
+    series,
+    sleep: s.results || [],
+    workouts: w.results || [],
+  };
+}
+
+// Cumulative metrics (steps, energy) sum across the day; discrete metrics
+// (weight, HR) average. The set decides which rollup a sample-backed metric gets.
+// Every cumulative quantity type in the HealthKit catalog, generated from the
+// SDK reference rather than typed by hand. Cumulative means a day is the sum
+// within one source and then the richest source wins - never the sum across
+// sources, which is how an iPhone and a Watch double a step count.
+const CUMULATIVE_METRICS = new Set([
+  "ActiveEnergyBurned", "AppleExerciseTime", "AppleMoveTime", "AppleStandTime",
+  "BasalEnergyBurned", "DietaryBiotin", "DietaryCaffeine", "DietaryCalcium",
+  "DietaryCarbohydrates", "DietaryChloride", "DietaryCholesterol", "DietaryChromium",
+  "DietaryCopper", "DietaryEnergyConsumed", "DietaryFatMonounsaturated",
+  "DietaryFatPolyunsaturated", "DietaryFatSaturated", "DietaryFatTotal", "DietaryFiber",
+  "DietaryFolate", "DietaryIodine", "DietaryIron", "DietaryMagnesium", "DietaryManganese",
+  "DietaryMolybdenum", "DietaryNiacin", "DietaryPantothenicAcid", "DietaryPhosphorus",
+  "DietaryPotassium", "DietaryProtein", "DietaryRiboflavin", "DietarySelenium",
+  "DietarySodium", "DietarySugar", "DietaryThiamin", "DietaryVitaminA", "DietaryVitaminB12",
+  "DietaryVitaminB6", "DietaryVitaminC", "DietaryVitaminD", "DietaryVitaminE",
+  "DietaryVitaminK", "DietaryWater", "DietaryZinc", "DistanceCrossCountrySkiing",
+  "DistanceCycling", "DistanceDownhillSnowSports", "DistancePaddleSports", "DistanceRowing",
+  "DistanceSkatingSports", "DistanceSwimming", "DistanceWalkingRunning", "DistanceWheelchair",
+  "FlightsClimbed", "InhalerUsage", "InsulinDelivery", "NikeFuel",
+  "NumberOfAlcoholicBeverages", "NumberOfTimesFallen", "PushCount", "StepCount",
+  "SwimmingStrokeCount", "TimeInDaylight", "MindfulSession"
+]);
+
+async function reconcileSampleDays(env, touched) {
+  if (!touched || !touched.length) return;
+  const seen = new Set();
+  const stmts = [];
+  for (const { metric, day } of touched) {
+    const k = metric + "|" + day;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    // Cumulative metrics must not be summed across sources: an iPhone and a
+    // Watch both counting steps would double the day. Sum within each source,
+    // then take the richest single source - the same rule the export.xml parser
+    // uses. Discrete metrics average across everything, which is source-safe.
+    const r = CUMULATIVE_METRICS.has(metric)
+      ? await env.HEALTH_DB.prepare(
+          `SELECT MAX(sv) AS v, MIN(smn) AS mn, MAX(smx) AS mx, SUM(scnt) AS cnt, MAX(sunit) AS unit
+             FROM (SELECT SUM(value) AS sv, MIN(value) AS smn, MAX(value) AS smx,
+                          COUNT(*) AS scnt, MAX(unit) AS sunit
+                     FROM hsample WHERE metric=?1 AND day=?2 GROUP BY src)`
+        ).bind(metric, day).first()
+      : await env.HEALTH_DB.prepare(
+          `SELECT AVG(value) AS v, MIN(value) AS mn, MAX(value) AS mx, COUNT(*) AS cnt,
+                  MAX(unit) AS unit FROM hsample WHERE metric=?1 AND day=?2`
+        ).bind(metric, day).first();
+    if (!r || r.v === null) continue;
+    stmts.push(metricUpsert(env, {
+      metric, day, unit: r.unit, value: r.v, mn: r.mn, mx: r.mx, cnt: r.cnt, src: "sample",
+    }));
+  }
+  if (stmts.length) await env.HEALTH_DB.batch(stmts);
+}
+
+async function refreshHealthSnapshot(env) {
+  const snap = await buildHealthSnapshot(env);
+  HMEM.snap = snap; HMEM.at = Date.now();
+  await env.CHART_KV.put(HEALTH_SNAP_KEY, JSON.stringify(snap));
+  return snap;
+}
+
+// Same stale-while-revalidate shape the macros chart uses: serve what we have,
+// refresh behind the response. A warm load touches memory only.
+// TEMPORARY: keeps the last 25 ingest attempts in KV so a phone-side failure
+// is visible from here. No key material is stored.
+const INGEST_LOG_KEY = "ingest_attempts_v1";
+async function logIngestAttempt(env, entry) {
+  try {
+    const raw = await env.CHART_KV.get(INGEST_LOG_KEY);
+    const cur = raw ? JSON.parse(raw) : { attempts: [] };
+    cur.attempts.unshift(entry);
+    cur.attempts = cur.attempts.slice(0, 25);
+    cur.count = (cur.count || 0) + 1;
+    await env.CHART_KV.put(INGEST_LOG_KEY, JSON.stringify(cur));
+  } catch (e) {}
+}
+
+async function getHealthSnapshot(env, ctx) {
+  const fresh = () => Date.now() - HMEM.at < HEALTH_MAX_SNAP_AGE_MS;
+  if (HMEM.snap && fresh()) return { snap: HMEM.snap, source: "memory" };
+  if (HMEM.snap) {
+    if (!HMEM.refreshing && ctx && ctx.waitUntil) {
+      HMEM.refreshing = true;
+      ctx.waitUntil(refreshHealthSnapshot(env).catch(() => {}).finally(() => { HMEM.refreshing = false; }));
+    }
+    return { snap: HMEM.snap, source: "memory-stale" };
+  }
+  const raw = await env.CHART_KV.get(HEALTH_SNAP_KEY);
+  if (raw) {
+    HMEM.snap = JSON.parse(raw); HMEM.at = Date.now();
+    if (ctx && ctx.waitUntil) ctx.waitUntil(refreshHealthSnapshot(env).catch(() => {}));
+    return { snap: HMEM.snap, source: "kv" };
+  }
+  return { snap: await refreshHealthSnapshot(env), source: "d1" };
+}
+
+const HEALTH_CARDS = [
+  { id: "body", title: "body", note: "Wyze Scale X",
+    series: ["BodyMass", "LeanBodyMass", "BodyFatPercentage", "BodyMassIndex"],
+    on: ["BodyMass", "BodyFatPercentage"] },
+  { id: "activity", title: "activity", note: "iPhone and Watch, one source per day so nothing double counts",
+    series: ["StepCount", "DistanceWalkingRunning", "FlightsClimbed", "AppleExerciseTime",
+             "ActiveEnergyBurned", "BasalEnergyBurned"],
+    on: ["StepCount", "ActiveEnergyBurned"] },
+  { id: "heart", title: "heart",
+    series: ["RestingHeartRate", "HeartRate", "WalkingHeartRateAverage", "HeartRateVariabilitySDNN", "VO2Max"],
+    on: ["RestingHeartRate", "HeartRateVariabilitySDNN"] },
+  { id: "sleep", title: "sleep", note: "hours per night by stage", kind: "sleep" },
+  { id: "workouts", title: "workouts", kind: "workouts" },
+  { id: "other", title: "everything else", note: "the long tail of what Health actually holds", kind: "rest" },
+];
+
+const HEALTH_LABELS = {
+  BodyMass: "Weight (lb)", LeanBodyMass: "Lean mass (lb)", BodyFatPercentage: "Body fat (%)",
+  BodyMassIndex: "BMI", StepCount: "Steps", DistanceWalkingRunning: "Walk + run (mi)",
+  FlightsClimbed: "Flights", AppleExerciseTime: "Exercise (min)",
+  ActiveEnergyBurned: "Active energy (kcal)", BasalEnergyBurned: "Resting energy (kcal)",
+  RestingHeartRate: "Resting HR", HeartRate: "Heart rate (avg)", WalkingHeartRateAverage: "Walking HR avg",
+  HeartRateVariabilitySDNN: "HRV (ms)", VO2Max: "VO2 max",
+};
+
+// Storage stays in HealthKit's native SI units, because that is what the
+// export.xml parser and the ingest conversions produce, and mixing units in one
+// table is how you get a chart that is wrong by 2.2x. Imperial is a display
+// choice, applied on the way out.
+//
+// Keyed by stored unit rather than by metric name, so a metric added later
+// converts automatically instead of quietly showing up in kilograms.
+const IMPERIAL = {
+  kg:      { unit: "lb",    f: v => v * 2.20462262185 },
+  g:       { unit: "oz",    f: v => v * 0.03527396195 },
+  km:      { unit: "mi",    f: v => v * 0.62137119224 },
+  m:       { unit: "ft",    f: v => v * 3.28083989501 },
+  cm:      { unit: "in",    f: v => v * 0.39370078740 },
+  L:       { unit: "fl oz", f: v => v * 33.8140227018 },
+  mL:      { unit: "fl oz", f: v => v * 0.03381402270 },
+  "m/s":   { unit: "mph",   f: v => v * 2.23693629205 },
+  "km/hr": { unit: "mph",   f: v => v * 0.62137119224 },
+  degC:    { unit: "degF",  f: v => v * 9 / 5 + 32 },
+  "°C":    { unit: "degF",  f: v => v * 9 / 5 + 32 },
+};
+
+// The main page inlines a recent window of health data so the cards paint with
+// the rest of the page; Year and All time fetch the remainder on demand.
+const HEALTH_INLINE_DAYS = 90;
+
+function trimHealthSnapshot(snap, n) {
+  if (!snap || !Array.isArray(snap.days)) return snap;
+  if (!n || snap.days.length <= n) return Object.assign({}, snap, { partial: false });
+  const days = snap.days.slice(-n);
+  const keep = new Set(days);
+  const series = {};
+  for (const [metric, e] of Object.entries(snap.series || {})) {
+    const points = (e.points || []).filter(p => keep.has(p[0]));
+    if (points.length) series[metric] = Object.assign({}, e, { points });
+  }
+  return Object.assign({}, snap, {
+    days,
+    series,
+    sleep: (snap.sleep || []).filter(x => keep.has(x.day)),
+    workouts: (snap.workouts || []).filter(x => keep.has(x.day)),
+    partial: true,
+  });
+}
+
+function healthDisplay(snap) {
+  if (!snap || !snap.series) return snap;
+  const series = {};
+  for (const [metric, e] of Object.entries(snap.series)) {
+    const conv = IMPERIAL[e.unit];
+    series[metric] = conv
+      ? { unit: conv.unit, points: e.points.map(([d, v]) => [d, Math.round(conv.f(v) * 100) / 100]) }
+      : e;
+  }
+  // Workout distances are stored in km on their own rows, not in series.
+  const workouts = (snap.workouts || []).map(w => (w.distance_km === null || w.distance_km === undefined)
+    ? w
+    : Object.assign({}, w, { distance_km: Math.round(w.distance_km * 0.62137119224 * 100) / 100, distance_unit: "mi" }));
+  return Object.assign({}, snap, { series, workouts });
+}
+
+// Health app body: static JS served external at /health-app.js with the
+// same immutable-cache + content-hash contract as /app.js.
+const HAPP_JS = `const DATA = P.snap, CARDS = P.cards, LABELS = P.labels;
+const GATE = window.__HG || "";
+if (GATE) { try { localStorage.setItem('cbum_gate', GATE); } catch (e) {} }
+
+const THEME = {
+  font: 'Inter, -apple-system, Segoe UI, Helvetica, Arial',
+  tickSize: 11, labelSize: 12, grid: '#ededed', axis: '#e4e4e4', tick: '#797979',
+  pastel: ['#63bd93','#f0a468','#7ba6ee','#ec8c8c','#b193de','#6cc4cc','#dcbc63','#ed94bf','#98a7b8']
+};
+const tickCfg = () => ({ color: THEME.tick, font: { size: THEME.tickSize, family: THEME.font } });
+
+/* ================= HSVG: SVG chart engine for the /health page =================
+   Chart.js 4.4.1-parity replacement for the health cards. Scale math, tick
+   generation, layout, bar/line geometry, tooltip geometry and event handling
+   are a 1:1 port of the exact library the page used to embed (/chart.js, chart
+   umd 4.4.1), so the SVG build renders pixel-equivalent to the old canvas
+   build - with vector text and no canvas drawing remaining (a hidden 2d
+   context measures text, exactly as Chart.js does for label sizing). Renders
+   are synchronous full rebuilds; hovers only move a DOM tooltip card. */
+const HSVG = (function () {
+  'use strict';
+
+  /* ---- numeric + generic helpers (chart.js 4.4.1 helpers.chunk) ---- */
+  const HALF_PI = Math.PI / 2;
+  const INFINITY = Number.POSITIVE_INFINITY;
+  const toRadians = degrees => degrees * (Math.PI / 180);
+  const toDegrees = radians => radians * (180 / Math.PI);
+  const toDimension = v => typeof v === 'string' && v.endsWith('%') ? parseFloat(v) / 100 : +v;
+  const valueOrDefault = (value, defaultValue) => value === undefined ? defaultValue : value;
+  const finiteOrDefault = (value, defaultValue) => isNumberFinite(value) ? value : defaultValue;
+  const defined = v => typeof v !== 'undefined';
+  const isNullOrUndef = v => v === null || typeof v === 'undefined';
+  const isArray = Array.isArray;
+  const isObject = v => v !== null && Object.prototype.toString.call(v) === '[object Object]';
+  const isNumberFinite = v => (typeof v === 'number' || v instanceof Number) && isFinite(+v);
+  const sign = v => v === 0 ? 0 : v > 0 ? 1 : -1;
+  const almostEquals = (x, y, epsilon) => Math.abs(x - y) < epsilon;
+  function niceNum(range) {
+    const roundedRange = Math.round(range);
+    range = almostEquals(range, roundedRange, range / 1000) ? roundedRange : range;
+    const niceRange = Math.pow(10, Math.floor(Math.log10(range)));
+    const fraction = range / niceRange;
+    const niceFraction = fraction <= 1 ? 1 : fraction <= 2 ? 2 : fraction <= 5 ? 5 : 10;
+    return niceFraction * niceRange;
+  }
+  function _factorize(value) {
+    const result = [];
+    const sqrt = Math.sqrt(value);
+    let i;
+    for (i = 1; i < sqrt; i++) {
+      if (value % i === 0) { result.push(i); result.push(value / i); }
+    }
+    if (sqrt === (sqrt | 0)) result.push(sqrt);
+    result.sort((a, b) => a - b).pop();
+    return result;
+  }
+  function almostWhole(x, epsilon) {
+    const rounded = Math.round(x);
+    return (rounded - epsilon) <= x && (rounded + epsilon) >= x;
+  }
+  function _decimalPlaces(x) {
+    if (!isFinite(x)) return 0;
+    let e = 1, p = 0;
+    while (Math.round(x * e) / e !== x) { e *= 10; p++; if (p > 20) break; }
+    return p;
+  }
+  const _limitValue = (value, min, max) => Math.max(Math.min(value, max), min);
+  const _int16Range = v => _limitValue(v, -32768, 32767);
+  function _setMinAndMaxByKey(array, target, property) {
+    let i, ilen, value;
+    for (i = 0, ilen = array.length; i < ilen; i++) {
+      value = array[i][property];
+      if (!isNaN(value)) {
+        target.min = Math.min(target.min, value);
+        target.max = Math.max(target.max, value);
+      }
+    }
+  }
+  function _addGrace(minmax, grace, beginAtZero) {
+    const min = minmax.min, max = minmax.max;
+    const change = toDimension(grace, (max - min) / 2);
+    const keepZero = (value, add) => beginAtZero && value === 0 ? 0 : value + add;
+    return { min: keepZero(min, -Math.abs(change)), max: keepZero(max, change) };
+  }
+
+  /* ---- fonts / text measurement (canvas metrics, same as chart.js) ---- */
+  const FONT_STRING = font => (font.style ? font.style + ' ' : '') + (font.weight ? font.weight + ' ' : '') + font.size + 'px ' + font.family;
+  function toLineHeight(value, size) {
+    let lineHeight = typeof value === 'string' ? parseFloat(value) : value;
+    if (lineHeight === undefined || isNaN(lineHeight)) lineHeight = 1.2 * size;
+    else if (lineHeight < 10 && !('' + value).endsWith('px')) lineHeight = lineHeight * size;
+    return lineHeight;
+  }
+  const DEFAULT_FONT = { family: "'Helvetica Neue', 'Helvetica', 'Arial', sans-serif", size: 12, style: 'normal', lineHeight: 1.2, weight: null };
+  function toFont(options, fallback) {
+    options = options || {};
+    fallback = fallback || DEFAULT_FONT;
+    let size = valueOrDefault(options.size, fallback.size);
+    if (typeof size === 'string') size = parseInt(size, 10);
+    const font = {
+      family: valueOrDefault(options.family, fallback.family),
+      lineHeight: toLineHeight(valueOrDefault(options.lineHeight, fallback.lineHeight), size),
+      size: size,
+      style: valueOrDefault(options.style, fallback.style),
+      weight: valueOrDefault(options.weight, fallback.weight)
+    };
+    font.string = FONT_STRING(font);
+    return font;
+  }
+  function toPadding(value) {
+    let t, r, b, l;
+    if (isObject(value)) {
+      t = valueOrDefault(value.top, 0);
+      r = valueOrDefault(value.right, 0);
+      b = valueOrDefault(value.bottom, 0);
+      l = valueOrDefault(value.left, 0);
+    } else {
+      t = r = b = l = value;
+    }
+    return { top: t, right: r, bottom: b, left: l, height: t + b, width: l + r };
+  }
+  let mctx = null;
+  function getMeasCtx() {
+    if (!mctx) mctx = document.createElement('canvas').getContext('2d');
+    return mctx;
+  }
+  function _measureText(ctx, data, gc, longest, string) {
+    let textWidth = data[string];
+    if (!textWidth) {
+      textWidth = data[string] = ctx.measureText(string).width;
+      gc.push(string);
+    }
+    if (textWidth > longest) longest = textWidth;
+    return longest;
+  }
+  function _longestText(ctx, font, arrayOfThings, cache) {
+    cache = cache || {};
+    let { data = {}, gc = [], fontString } = cache;
+    const makesFontContextCache = font.string !== fontString;
+    if (makesFontContextCache) {
+      fontString = font.string;
+      data = {};
+      gc = [];
+      ctx.font = fontString;
+    }
+    let longest = 0;
+    const ilen = arrayOfThings.length;
+    let i;
+    for (i = 0; i < ilen; i++) {
+      const thing = arrayOfThings[i];
+      if (thing !== undefined && thing !== null && !isArray(thing)) {
+        longest = _measureText(ctx, data, gc, longest, thing);
+      } else if (isArray(thing)) {
+        for (let j = 0, jlen = thing.length; j < jlen; j++) {
+          const nestedThing = thing[j];
+          if (nestedThing !== undefined && nestedThing !== null && !isArray(nestedThing)) {
+            longest = _measureText(ctx, data, gc, longest, nestedThing);
+          }
+        }
+      }
+    }
+    if (makesFontContextCache) cache.data = data, cache.gc = gc, cache.fontString = fontString;
+    else cache.data = data, cache.gc = gc;
+    return longest;
+  }
+  function garbageCollect(caches, duration) {
+    Object.keys(caches).forEach(fontString => {
+      const cache = caches[fontString];
+      const gc = cache.gc;
+      const gcLen = gc.length / 2;
+      let i;
+      if (gcLen > duration) {
+        for (i = 0; i < gcLen; ++i) delete cache.data[gc[i]];
+        gc.splice(0, gcLen);
+      }
+    });
+  }
+  const distanceBetweenPoints = (pt1, pt2) => {
+    const dx = pt2.x - pt1.x, dy = pt2.y - pt1.y;
+    return Math.sqrt(dx * dx + dy * dy);
+  };
+  const _isPointInArea = (point, area, margin) => {
+    margin = margin || 0.5;
+    return !area || (point && point.x > area.left - margin && point.x < area.right + margin && point.y > area.top - margin && point.y < area.bottom + margin);
+  };
+  function _alignPixel(chart, pixel, width) {
+    const devicePixelRatio = chart.currentDevicePixelRatio;
+    const halfWidth = width !== 0 ? Math.max(width / 2, 0.5) : 0;
+    return Math.round((pixel - halfWidth) * devicePixelRatio) / devicePixelRatio + halfWidth;
+  }
+
+  /* ---- splines (verbatim splineCurve + bezier control points) ---- */
+  const EPSILON = Number.EPSILON || 1e-14;
+  const getPoint = (points, i) => i < points.length && !points[i].skip && points[i];
+  function splineCurve(firstPoint, middlePoint, afterPoint, t) {
+    const previous = firstPoint.skip ? middlePoint : firstPoint;
+    const current = middlePoint;
+    const next = afterPoint.skip ? middlePoint : afterPoint;
+    const d01 = distanceBetweenPoints(current, previous);
+    const d12 = distanceBetweenPoints(next, current);
+    let s01 = d01 / (d01 + d12);
+    let s12 = d12 / (d01 + d12);
+    s01 = isNaN(s01) ? 0 : s01;
+    s12 = isNaN(s12) ? 0 : s12;
+    const fa = t * s01;
+    const fb = t * s12;
+    return {
+      previous: { x: current.x - fa * (next.x - previous.x), y: current.y - fa * (next.y - previous.y) },
+      next: { x: current.x + fb * (next.x - previous.x), y: current.y + fb * (next.y - previous.y) }
+    };
+  }
+  function capControlPoint(pt, min, max) { return Math.max(Math.min(pt, max), min); }
+  function capBezierPoints(points, area) {
+    let i, ilen, point, inArea, inAreaPrev;
+    let inAreaNext = _isPointInArea(points[0], area);
+    for (i = 0, ilen = points.length; i < ilen; ++i) {
+      inAreaPrev = inArea;
+      inArea = inAreaNext;
+      inAreaNext = i < ilen - 1 && _isPointInArea(points[i + 1], area);
+      if (!inArea) continue;
+      point = points[i];
+      if (inAreaPrev) {
+        point.cp1x = capControlPoint(point.cp1x, area.left, area.right);
+        point.cp1y = capControlPoint(point.cp1y, area.top, area.bottom);
+      }
+      if (inAreaNext) {
+        point.cp2x = capControlPoint(point.cp2x, area.left, area.right);
+        point.cp2y = capControlPoint(point.cp2y, area.top, area.bottom);
+      }
+    }
+  }
+  function _updateBezierControlPoints(points, options, area, loop, indexAxis) {
+    let i, ilen, point, controlPoints;
+    if (options.spanGaps) points = points.filter(pt => !pt.skip);
+    let prev = loop ? points[points.length - 1] : points[0];
+    for (i = 0, ilen = points.length; i < ilen; ++i) {
+      point = points[i];
+      controlPoints = splineCurve(prev, point, points[Math.min(i + 1, ilen - (loop ? 0 : 1)) % ilen], options.tension);
+      point.cp1x = controlPoints.previous.x;
+      point.cp1y = controlPoints.previous.y;
+      point.cp2x = controlPoints.next.x;
+      point.cp2y = controlPoints.next.y;
+      prev = point;
+    }
+    if (options.capBezierPoints !== false) capBezierPoints(points, area);
+  }
+
+  /* ---- numeric tick generation (generateTicks$1 + Ticks.formatters.numeric) ---- */
+  function generateTicksNumeric(generationOptions, dataRange) {
+    const ticks = [];
+    const MIN_SPACING = 1e-14;
+    const bounds = generationOptions.bounds, step = generationOptions.step,
+      min = generationOptions.min, max = generationOptions.max,
+      precision = generationOptions.precision, count = generationOptions.count,
+      maxTicks = generationOptions.maxTicks, maxDigits = generationOptions.maxDigits,
+      includeBounds = generationOptions.includeBounds;
+    const unit = step || 1;
+    const maxSpaces = maxTicks - 1;
+    const rmin = dataRange.min, rmax = dataRange.max;
+    const minDefined = !isNullOrUndef(min);
+    const maxDefined = !isNullOrUndef(max);
+    const countDefined = !isNullOrUndef(count);
+    const minSpacing = (rmax - rmin) / (maxDigits + 1);
+    let spacing = niceNum((rmax - rmin) / maxSpaces / unit) * unit;
+    let factor, niceMin, niceMax, numSpaces;
+    if (spacing < MIN_SPACING && !minDefined && !maxDefined) return [{ value: rmin }, { value: rmax }];
+    numSpaces = Math.ceil(rmax / spacing) - Math.floor(rmin / spacing);
+    if (numSpaces > maxSpaces) spacing = niceNum(numSpaces * spacing / maxSpaces / unit) * unit;
+    if (spacing < 1 && isNullOrUndef(precision)) spacing = 1; /* whole-integer ticks (Owner 8/15) */
+    if (!isNullOrUndef(precision)) { factor = Math.pow(10, precision); spacing = Math.ceil(spacing * factor) / factor; }
+    if (bounds === 'ticks') {
+      niceMin = Math.floor(rmin / spacing) * spacing;
+      niceMax = Math.ceil(rmax / spacing) * spacing;
+    } else {
+      niceMin = rmin;
+      niceMax = rmax;
+    }
+    if (minDefined && maxDefined && step && almostWhole((max - min) / step, spacing / 1000)) {
+      numSpaces = Math.round(Math.min((max - min) / spacing, maxTicks));
+      spacing = (max - min) / numSpaces;
+      niceMin = min;
+      niceMax = max;
+    } else if (countDefined) {
+      niceMin = minDefined ? min : niceMin;
+      niceMax = maxDefined ? max : niceMax;
+      numSpaces = count - 1;
+      spacing = (niceMax - niceMin) / numSpaces;
+    } else {
+      numSpaces = (niceMax - niceMin) / spacing;
+      if (almostEquals(numSpaces, Math.round(numSpaces), spacing / 1000)) numSpaces = Math.round(numSpaces);
+      else numSpaces = Math.ceil(numSpaces);
+    }
+    const decimalPlaces = Math.max(_decimalPlaces(spacing), _decimalPlaces(niceMin));
+    factor = Math.pow(10, isNullOrUndef(precision) ? decimalPlaces : precision);
+    niceMin = Math.round(niceMin * factor) / factor;
+    niceMax = Math.round(niceMax * factor) / factor;
+    let j = 0;
+    if (minDefined) {
+      if (includeBounds && niceMin !== min) {
+        ticks.push({ value: min });
+        if (niceMin < min) j++;
+        if (almostEquals(Math.round((niceMin + j * spacing) * factor) / factor, min, relativeLabelSize(min, minSpacing, generationOptions))) j++;
+      } else if (niceMin < min) j++;
+    }
+    for (; j < numSpaces; ++j) {
+      const tickValue = Math.round((niceMin + j * spacing) * factor) / factor;
+      if (maxDefined && tickValue > max) break;
+      ticks.push({ value: tickValue });
+    }
+    if (maxDefined && includeBounds && niceMax !== max) {
+      if (ticks.length && almostEquals(ticks[ticks.length - 1].value, max, relativeLabelSize(max, minSpacing, generationOptions))) {
+        ticks[ticks.length - 1].value = max;
+      } else {
+        ticks.push({ value: max });
+      }
+    } else if (!maxDefined || niceMax === max) {
+      ticks.push({ value: niceMax });
+    }
+    return ticks;
+  }
+  function relativeLabelSize(value, minSpacing, opts) {
+    const horizontal = opts.horizontal, minRotation = opts.minRotation;
+    const rad = toRadians(minRotation);
+    const ratio = (horizontal ? Math.sin(rad) : Math.cos(rad)) || 0.001;
+    const length = 0.75 * minSpacing * ('' + value).length;
+    return Math.min(minSpacing / ratio, length);
+  }
+  function calcTickDelta(tickValue, ticks) {
+    let delta = ticks.length > 3 ? ticks[2].value - ticks[1].value : ticks[1].value - ticks[0].value;
+    if (Math.abs(delta) >= 1 && tickValue !== Math.floor(tickValue)) delta = tickValue - Math.floor(tickValue);
+    return delta;
+  }
+  function numericTickLabel(tickValue, index, ticks) {
+    if (tickValue === 0) return '0';
+    let delta = tickValue, sci = false;
+    if (ticks.length > 1) {
+      const maxTick = Math.max(Math.abs(ticks[0].value), Math.abs(ticks[ticks.length - 1].value));
+      if (maxTick < 1e-4 || maxTick > 1e+15) sci = true;
+      delta = calcTickDelta(tickValue, ticks);
+    }
+    const logDelta = Math.log10(Math.abs(delta));
+    const numDecimal = 0; /* whole-integer chart labels only (Owner 8/15) */
+    const o = { minimumFractionDigits: numDecimal, maximumFractionDigits: numDecimal };
+    if (sci) o.notation = 'scientific';
+    return new Intl.NumberFormat(undefined, o).format(tickValue);
+  }
+
+  /* ---- category tick auto-skip (core.scale autoskip helpers) ---- */
+  function sample(arr, numItems) {
+    const result = [];
+    const increment = arr.length / numItems;
+    const len = arr.length;
+    let i = 0;
+    for (; i < len; i += increment) result.push(arr[Math.floor(i)]);
+    return result;
+  }
+  const getTicksLimit = (ticksLength, maxTicksLimit) => Math.min(maxTicksLimit || ticksLength, ticksLength);
+  function getEvenSpacing(arr) {
+    const len = arr.length;
+    let i, diff;
+    if (len < 2) return false;
+    for (diff = arr[0], i = 1; i < len; ++i) {
+      if (arr[i] - arr[i - 1] !== diff) return false;
+    }
+    return diff;
+  }
+  function getMajorIndices(ticks) {
+    const result = [];
+    for (let i = 0, ilen = ticks.length; i < ilen; i++) if (ticks[i].major) result.push(i);
+    return result;
+  }
+  function skipMajors(ticks, newTicks, majorIndices, spacing) {
+    let count = 0;
+    let next = majorIndices[0];
+    let i;
+    spacing = Math.ceil(spacing);
+    for (i = 0; i < ticks.length; i++) {
+      if (i === next) {
+        newTicks.push(ticks[i]);
+        count++;
+        next = majorIndices[count * spacing];
+      }
+    }
+  }
+  function skip(ticks, newTicks, spacing, majorStart, majorEnd) {
+    const start = valueOrDefault(majorStart, 0);
+    const end = Math.min(valueOrDefault(majorEnd, ticks.length), ticks.length);
+    let count = 0;
+    let length, i, next;
+    spacing = Math.ceil(spacing);
+    if (majorEnd) {
+      length = majorEnd - majorStart;
+      spacing = length / Math.floor(length / spacing);
+    }
+    next = start;
+    while (next < 0) {
+      count++;
+      next = Math.round(start + count * spacing);
+    }
+    for (i = Math.max(start, 0); i < end; i++) {
+      if (i === next) {
+        newTicks.push(ticks[i]);
+        count++;
+        next = Math.round(start + count * spacing);
+      }
+    }
+  }
+  function calculateSpacing(majorIndices, ticks, ticksLimit) {
+    const evenMajorSpacing = getEvenSpacing(majorIndices);
+    const spacing = ticks.length / ticksLimit;
+    if (!evenMajorSpacing) return Math.max(spacing, 1);
+    const factors = _factorize(evenMajorSpacing);
+    for (let i = 0, ilen = factors.length - 1; i < ilen; i++) {
+      const factor = factors[i];
+      if (factor > spacing) return factor;
+    }
+    return Math.max(spacing, 1);
+  }
+  function determineMaxTicks(scale) {
+    const offset = scale.options.offset;
+    const tickLength = scale._tickSize();
+    const maxScale = scale._length / tickLength + (offset ? 0 : 1);
+    const maxChart = scale._maxLength / tickLength;
+    return Math.floor(Math.min(maxScale, maxChart));
+  }
+  function autoSkip(scale, ticks) {
+    const tickOpts = scale.options.ticks;
+    const determinedMaxTicks = determineMaxTicks(scale);
+    const ticksLimit = Math.min(tickOpts.maxTicksLimit || determinedMaxTicks, determinedMaxTicks);
+    const majorIndices = tickOpts.major.enabled ? getMajorIndices(ticks) : [];
+    const numMajorIndices = majorIndices.length;
+    const first = majorIndices[0];
+    const last = majorIndices[numMajorIndices - 1];
+    const newTicks = [];
+    if (numMajorIndices > ticksLimit) {
+      skipMajors(ticks, newTicks, majorIndices, numMajorIndices / ticksLimit);
+      return newTicks;
+    }
+    const spacing = calculateSpacing(majorIndices, ticks, ticksLimit);
+    if (numMajorIndices > 0) {
+      let i, ilen;
+      const avgMajorSpacing = numMajorIndices > 1 ? Math.round((last - first) / (numMajorIndices - 1)) : null;
+      skip(ticks, newTicks, spacing, isNullOrUndef(avgMajorSpacing) ? 0 : first - avgMajorSpacing, first);
+      for (i = 0, ilen = numMajorIndices - 1; i < ilen; i++) skip(ticks, newTicks, spacing, majorIndices[i], majorIndices[i + 1]);
+      skip(ticks, newTicks, spacing, last, isNullOrUndef(avgMajorSpacing) ? ticks.length : last + avgMajorSpacing);
+      return newTicks;
+    }
+    skip(ticks, newTicks, spacing);
+    return newTicks;
+  }
+
+  /* ---- small scale helpers ---- */
+  const getTickMarkLength = options => options.drawTicks ? options.tickLength : 0;
+  function getTitleHeight(options, fallbackFont) {
+    if (!options.display) return 0;
+    const font = toFont(options.font, fallbackFont);
+    const padding = toPadding(options.padding);
+    const lines = isArray(options.text) ? options.text.length : 1;
+    return lines * font.lineHeight + padding.height;
+  }
+
+  /* ---- Scale: 1:1 port of core.scale + scale.category + scale.linear ---- */
+  function HScale(chart, options) {
+    this.chart = chart;
+    this.id = options.id;
+    this.type = options.type;
+    this.options = options;
+    this.axis = options.axis;
+    this.top = this.bottom = this.left = this.right = this.width = this.height = undefined;
+    this._margins = { left: 0, right: 0, top: 0, bottom: 0 };
+    this.maxWidth = this.maxHeight = undefined;
+    this.paddingTop = this.paddingBottom = this.paddingLeft = this.paddingRight = 0;
+    this.labelRotation = undefined;
+    this.min = this.max = undefined;
+    this._range = undefined;
+    this.ticks = [];
+    this._gridLineItems = null;
+    this._labelItems = null;
+    this._labelSizes = null;
+    this._length = 0;
+    this._maxLength = 0;
+    this._longestTextCache = {};
+    this._startPixel = this._endPixel = undefined;
+    this._reversePixels = false;
+    this._alignToPixels = false;
+    this._dataLimitsCached = false;
+    this._borderValue = 0;
+    this.fullSize = false;
+    this.weight = 0;
+    this.position = options.position;
+  }
+  HScale.prototype.isHorizontal = function () {
+    const position = this.options.position, axis = this.axis;
+    return position === 'top' || position === 'bottom' || axis === 'x';
+  };
+  HScale.prototype.getLabels = function () {
+    return this.chart.data.labels || [];
+  };
+  HScale.prototype.parse = function (raw) { return this.type === 'category' ? (isNullOrUndef(raw) ? null : +raw) : (isNullOrUndef(raw) || !isFinite(+raw) ? null : +raw); };
+  HScale.prototype.getUserBounds = function () {
+    const o = this.options;
+    const _suggestedMin = isNullOrUndef(o.suggestedMin) ? INFINITY : +o.suggestedMin;
+    const _suggestedMax = isNullOrUndef(o.suggestedMax) ? -INFINITY : +o.suggestedMax;
+    return {
+      min: finiteOrDefault(undefined, _suggestedMin),
+      max: finiteOrDefault(undefined, _suggestedMax),
+      minDefined: false,
+      maxDefined: false
+    };
+  };
+  HScale.prototype.getMinMax = function (canStack) {
+    let { min, max, minDefined, maxDefined } = this.getUserBounds();
+    let range;
+    if (minDefined && maxDefined) return { min, max };
+    const metas = this.getMatchingVisibleMetas();
+    for (let i = 0, ilen = metas.length; i < ilen; ++i) {
+      range = controllerGetMinMax(this.chart, metas[i], this, canStack);
+      if (!minDefined) min = Math.min(min, range.min);
+      if (!maxDefined) max = Math.max(max, range.max);
+    }
+    min = maxDefined && min > max ? max : min;
+    max = minDefined && min > max ? min : max;
+    return {
+      min: finiteOrDefault(min, finiteOrDefault(max, min)),
+      max: finiteOrDefault(max, finiteOrDefault(min, max))
+    };
+  };
+  HScale.prototype.getMatchingVisibleMetas = function (type) {
+    const result = [];
+    const axisID = this.axis + 'AxisID';
+    const metas = this.chart.metas;
+    for (let i = 0; i < metas.length; i++) {
+      const meta = metas[i];
+      if (meta[axisID] === this.id && (!type || meta.type === type)) result.push(meta);
+    }
+    return result;
+  };
+  HScale.prototype._isVisible = function () {
+    const display = this.options.display;
+    if (display !== 'auto') return !!display;
+    return this.getMatchingVisibleMetas().length > 0;
+  };
+  HScale.prototype.getPadding = function () {
+    return {
+      left: this.paddingLeft || 0,
+      top: this.paddingTop || 0,
+      right: this.paddingRight || 0,
+      bottom: this.paddingBottom || 0
+    };
+  };  HScale.prototype.update = function (maxWidth, maxHeight, margins) {
+    const beginAtZero = this.options.beginAtZero, grace = this.options.grace, tickOpts = this.options.ticks;
+    const sampleSize = tickOpts.sampleSize;
+    this.maxWidth = maxWidth;
+    this.maxHeight = maxHeight;
+    this._margins = margins = Object.assign({ left: 0, right: 0, top: 0, bottom: 0 }, margins);
+    this.ticks = null;
+    this._labelSizes = null;
+    this._gridLineItems = null;
+    this._labelItems = null;
+    this.setDimensions();
+    this._maxLength = this.isHorizontal() ? this.width + margins.left + margins.right : this.height + margins.top + margins.bottom;
+    if (!this._dataLimitsCached) {
+      this.determineDataLimits();
+      this._range = _addGrace(this, grace, beginAtZero);
+      this._dataLimitsCached = true;
+    }
+    this.ticks = this.buildTicks() || [];
+    const samplingEnabled = sampleSize < this.ticks.length;
+    this._convertTicksToLabels(samplingEnabled ? sample(this.ticks, sampleSize) : this.ticks);
+    this.configure();
+    this.calculateLabelRotation();
+    if (tickOpts.display && tickOpts.autoSkip) {
+      this.ticks = autoSkip(this, this.ticks);
+      this._labelSizes = null;
+    }
+    if (samplingEnabled) this._convertTicksToLabels(this.ticks);
+    this.fit();
+  };
+  HScale.prototype.setDimensions = function () {
+    if (this.isHorizontal()) {
+      this.width = this.maxWidth;
+      this.left = 0;
+      this.right = this.width;
+    } else {
+      this.height = this.maxHeight;
+      this.top = 0;
+      this.bottom = this.height;
+    }
+    this.paddingLeft = 0;
+    this.paddingTop = 0;
+    this.paddingRight = 0;
+    this.paddingBottom = 0;
+  };
+  HScale.prototype.determineDataLimits = function () {
+    if (this.type === 'category') {
+      this.min = 0;
+      this.max = this.getLabels().length - 1;
+      return;
+    }
+    const { min, max } = this.getMinMax(true);
+    this.min = isNumberFinite(min) ? min : 0;
+    this.max = isNumberFinite(max) ? max : 1;
+    this.handleTickRangeOptions();
+  };
+  HScale.prototype.handleTickRangeOptions = function () {
+    const beginAtZero = this.options.beginAtZero;
+    const { minDefined, maxDefined } = this.getUserBounds();
+    let min = this.min, max = this.max;
+    const setMin = v => { min = minDefined ? min : v; };
+    const setMax = v => { max = maxDefined ? max : v; };
+    if (beginAtZero) {
+      const minSign = sign(min);
+      const maxSign = sign(max);
+      if (minSign < 0 && maxSign < 0) setMax(0);
+      else if (minSign > 0 && maxSign > 0) setMin(0);
+    }
+    if (min === max) {
+      const offset = max === 0 ? 1 : Math.abs(max * 0.05);
+      setMax(max + offset);
+      if (!beginAtZero) setMin(min - offset);
+    }
+    this.min = min;
+    this.max = max;
+  };
+  HScale.prototype.buildTicks = function () {
+    if (this.type === 'category') {
+      const min = this.min, max = this.max, offset = this.options.offset;
+      let labels = this.getLabels();
+      labels = min === 0 && max === labels.length - 1 ? labels : labels.slice(min, max + 1);
+      this._valueRange = Math.max(labels.length - (offset ? 0 : 1), 1);
+      this._startValue = this.min - (offset ? 0.5 : 0);
+      const ticks = [];
+      for (let value = min; value <= max; value++) ticks.push({ value: value });
+      return ticks;
+    }
+    const opts = this.options;
+    const tickOpts = opts.ticks;
+    let maxTicks = this.getTickLimit();
+    maxTicks = Math.max(2, maxTicks);
+    const generationOptions = {
+      maxTicks: maxTicks,
+      bounds: opts.bounds,
+      min: opts.min,
+      max: opts.max,
+      precision: tickOpts.precision,
+      step: tickOpts.stepSize,
+      count: tickOpts.count,
+      maxDigits: this._maxDigits(),
+      horizontal: this.isHorizontal(),
+      minRotation: tickOpts.minRotation || 0,
+      includeBounds: tickOpts.includeBounds !== false
+    };
+    const dataRange = this._range || this;
+    const ticks = generateTicksNumeric(generationOptions, dataRange);
+    if (opts.bounds === 'ticks') _setMinAndMaxByKey(ticks, this, 'value');
+    this.start = this.min;
+    this.end = this.max;
+    return ticks;
+  };
+  HScale.prototype.getTickLimit = function () {
+    const tickOpts = this.options.ticks;
+    let { maxTicksLimit, stepSize } = tickOpts;
+    let maxTicks;
+    if (stepSize) {
+      maxTicks = Math.ceil(this.max / stepSize) - Math.floor(this.min / stepSize) + 1;
+      if (maxTicks > 1000) maxTicks = 1000;
+    } else {
+      maxTicks = this.computeTickLimit();
+      maxTicksLimit = maxTicksLimit || 11;
+    }
+    if (maxTicksLimit) maxTicks = Math.min(maxTicksLimit, maxTicks);
+    return maxTicks;
+  };
+  HScale.prototype.computeTickLimit = function () {
+    const horizontal = this.isHorizontal();
+    const length = horizontal ? this.width : this.height;
+    const minRotation = toRadians(this.options.ticks.minRotation);
+    const ratio = (horizontal ? Math.sin(minRotation) : Math.cos(minRotation)) || 0.001;
+    const tickFont = this._resolveTickFontOptions(0);
+    return Math.ceil(length / Math.min(40, tickFont.lineHeight / ratio));
+  };
+  HScale.prototype._maxDigits = function () {
+    const fontSize = this._resolveTickFontOptions(0).lineHeight;
+    return (this.isHorizontal() ? this.width : this.height) / fontSize;
+  };
+  HScale.prototype._resolveTickFontOptions = function (index) {
+    return toFont(this.options.ticks.font, this.chart.font);
+  };
+  HScale.prototype.generateTickLabels = function (ticks) {
+    const tickOpts = this.options.ticks;
+    for (let i = 0, ilen = ticks.length; i < ilen; i++) {
+      const tick = ticks[i];
+      if (tickOpts.callback) { tick.label = tickOpts.callback.call(this, tick.value, i, ticks); continue; }
+      if (this.type === 'category') {
+        const labels = this.getLabels();
+        tick.label = tick.value >= 0 && tick.value < labels.length ? labels[tick.value] : tick.value;
+      } else {
+        tick.label = numericTickLabel(tick.value, i, ticks);
+      }
+    }
+  };
+  HScale.prototype._convertTicksToLabels = function (ticks) {
+    this.generateTickLabels(ticks);
+    let i, ilen;
+    for (i = 0, ilen = ticks.length; i < ilen; i++) {
+      if (isNullOrUndef(ticks[i].label)) { ticks.splice(i, 1); ilen--; i--; }
+    }
+  };
+  HScale.prototype.configure = function () {
+    let reversePixels = this.options.reverse;
+    let startPixel, endPixel;
+    if (this.isHorizontal()) {
+      startPixel = this.left;
+      endPixel = this.right;
+    } else {
+      startPixel = this.top;
+      endPixel = this.bottom;
+      reversePixels = !reversePixels;
+    }
+    this._startPixel = startPixel;
+    this._endPixel = endPixel;
+    this._reversePixels = reversePixels;
+    this._length = endPixel - startPixel;
+    this._alignToPixels = this.options.alignToPixels;
+    if (this.type !== 'category') {
+      const ticks = this.ticks;
+      let start = this.min, end = this.max;
+      if (this.options.offset && ticks.length) {
+        const offset = (end - start) / Math.max(ticks.length - 1, 1) / 2;
+        start -= offset;
+        end += offset;
+      }
+      this._startValue = start;
+      this._endValue = end;
+      this._valueRange = end - start;
+    } else {
+      // CategoryScale.configure: horizontal scales keep _reversePixels false
+      if (!this.isHorizontal()) this._reversePixels = !this._reversePixels;
+    }
+  };
+  HScale.prototype.calculateLabelRotation = function () {
+    const options = this.options;
+    const tickOpts = options.ticks;
+    const numTicks = getTicksLimit(this.ticks.length, options.ticks.maxTicksLimit);
+    const minRotation = tickOpts.minRotation || 0;
+    const maxRotation = tickOpts.maxRotation;
+    let labelRotation = minRotation;
+    let tickWidth, maxHeight, maxLabelDiagonal;
+    if (!this._isVisible() || !tickOpts.display || minRotation >= maxRotation || numTicks <= 1 || !this.isHorizontal()) {
+      this.labelRotation = minRotation;
+      return;
+    }
+    const labelSizes = this._getLabelSizes();
+    const maxLabelWidth = labelSizes.widest.width;
+    const maxLabelHeight = labelSizes.highest.height;
+    const maxWidth = _limitValue(this.chart.width - maxLabelWidth, 0, this.maxWidth);
+    tickWidth = options.offset ? this.maxWidth / numTicks : maxWidth / (numTicks - 1);
+    if (maxLabelWidth + 6 > tickWidth) {
+      tickWidth = maxWidth / (numTicks - (options.offset ? 0.5 : 1));
+      maxHeight = this.maxHeight - getTickMarkLength(options.grid) - tickOpts.padding - getTitleHeight(options.title, this.chart.font);
+      maxLabelDiagonal = Math.sqrt(maxLabelWidth * maxLabelWidth + maxLabelHeight * maxLabelHeight);
+      labelRotation = toDegrees(Math.min(Math.asin(_limitValue((labelSizes.highest.height + 6) / tickWidth, -1, 1)), Math.asin(_limitValue(maxHeight / maxLabelDiagonal, -1, 1)) - Math.asin(_limitValue(maxLabelHeight / maxLabelDiagonal, -1, 1))));
+      labelRotation = Math.max(minRotation, Math.min(maxRotation, labelRotation));
+    }
+    this.labelRotation = labelRotation;
+  };
+  HScale.prototype.fit = function () {
+    const minSize = { width: 0, height: 0 };
+    const chart = this.chart, options = this.options,
+      tickOpts = options.ticks, titleOpts = options.title, gridOpts = options.grid;
+    const display = this._isVisible();
+    const isHorizontal = this.isHorizontal();
+    if (display) {
+      const titleHeight = getTitleHeight(titleOpts, chart.font);
+      if (isHorizontal) {
+        minSize.width = this.maxWidth;
+        minSize.height = getTickMarkLength(gridOpts) + titleHeight;
+      } else {
+        minSize.height = this.maxHeight;
+        minSize.width = getTickMarkLength(gridOpts) + titleHeight;
+      }
+      if (tickOpts.display && this.ticks.length) {
+        const { first, last, widest, highest } = this._getLabelSizes();
+        const tickPadding = tickOpts.padding * 2;
+        const angleRadians = toRadians(this.labelRotation);
+        const cos = Math.cos(angleRadians);
+        const sin = Math.sin(angleRadians);
+        if (isHorizontal) {
+          const labelHeight = tickOpts.mirror ? 0 : sin * widest.width + cos * highest.height;
+          minSize.height = Math.min(this.maxHeight, minSize.height + labelHeight + tickPadding);
+        } else {
+          const labelWidth = tickOpts.mirror ? 0 : cos * widest.width + sin * highest.height;
+          minSize.width = Math.min(this.maxWidth, minSize.width + labelWidth + tickPadding);
+        }
+        this._calculatePadding(first, last, sin, cos);
+      }
+    }
+    this._handleMargins();
+    if (isHorizontal) {
+      this.width = this._length = chart.width - this._margins.left - this._margins.right;
+      this.height = minSize.height;
+    } else {
+      this.width = minSize.width;
+      this.height = this._length = chart.height - this._margins.top - this._margins.bottom;
+    }
+  };
+  HScale.prototype._calculatePadding = function (first, last, sin, cos) {
+    const ticksOpts = this.options.ticks, align = ticksOpts.align, padding = ticksOpts.padding;
+    const position = this.options.position;
+    const isRotated = this.labelRotation !== 0;
+    const labelsBelowTicks = position !== 'top' && this.axis === 'x';
+    if (this.isHorizontal()) {
+      const offsetLeft = this.getPixelForTick(0) - this.left;
+      const offsetRight = this.right - this.getPixelForTick(this.ticks.length - 1);
+      let paddingLeft = 0;
+      let paddingRight = 0;
+      if (isRotated) {
+        if (labelsBelowTicks) {
+          paddingLeft = cos * first.width;
+          paddingRight = sin * last.height;
+        } else {
+          paddingLeft = sin * first.height;
+          paddingRight = cos * last.width;
+        }
+      } else if (align === 'start') {
+        paddingRight = last.width;
+      } else if (align === 'end') {
+        paddingLeft = first.width;
+      } else if (align !== 'inner') {
+        paddingLeft = first.width / 2;
+        paddingRight = last.width / 2;
+      }
+      this.paddingLeft = Math.max((paddingLeft - offsetLeft + padding) * this.width / (this.width - offsetLeft), 0);
+      this.paddingRight = Math.max((paddingRight - offsetRight + padding) * this.width / (this.width - offsetRight), 0);
+    } else {
+      let paddingTop = last.height / 2;
+      let paddingBottom = first.height / 2;
+      if (align === 'start') {
+        paddingTop = 0;
+        paddingBottom = first.height;
+      } else if (align === 'end') {
+        paddingTop = last.height;
+        paddingBottom = 0;
+      }
+      this.paddingTop = paddingTop + padding;
+      this.paddingBottom = paddingBottom + padding;
+    }
+  };
+  HScale.prototype._handleMargins = function () {
+    if (this._margins) {
+      this._margins.left = Math.max(this.paddingLeft, this._margins.left);
+      this._margins.top = Math.max(this.paddingTop, this._margins.top);
+      this._margins.right = Math.max(this.paddingRight, this._margins.right);
+      this._margins.bottom = Math.max(this.paddingBottom, this._margins.bottom);
+    }
+  };
+  HScale.prototype._getLabelSizes = function () {
+    let labelSizes = this._labelSizes;
+    if (!labelSizes) {
+      const sampleSize = this.options.ticks.sampleSize;
+      let ticks = this.ticks;
+      if (sampleSize < ticks.length) ticks = sample(ticks, sampleSize);
+      this._labelSizes = labelSizes = this._computeLabelSizes(ticks, ticks.length, this.options.ticks.maxTicksLimit);
+    }
+    return labelSizes;
+  };
+  HScale.prototype._computeLabelSizes = function (ticks, length, maxTicksLimit) {
+    const ctx = getMeasCtx();
+    const caches = this._longestTextCache;
+    const widths = [];
+    const heights = [];
+    const increment = Math.floor(length / getTicksLimit(length, maxTicksLimit));
+    let widestLabelSize = 0;
+    let highestLabelSize = 0;
+    let i, label, tickFont, fontString, cache, lineHeight, width, height;
+    for (i = 0; i < length; i += increment) {
+      label = ticks[i].label;
+      tickFont = this._resolveTickFontOptions(i);
+      ctx.font = fontString = tickFont.string;
+      cache = caches[fontString] = caches[fontString] || { data: {}, gc: [] };
+      lineHeight = tickFont.lineHeight;
+      width = height = 0;
+      if (label !== undefined && label !== null && !isArray(label)) {
+        width = _measureText(ctx, cache.data, cache.gc, width, label);
+        height = lineHeight;
+      } else if (isArray(label)) {
+        for (let j = 0, jlen = label.length; j < jlen; ++j) {
+          const nestedLabel = label[j];
+          if (nestedLabel !== undefined && nestedLabel !== null && !isArray(nestedLabel)) {
+            width = _measureText(ctx, cache.data, cache.gc, width, nestedLabel);
+            height += lineHeight;
+          }
+        }
+      }
+      widths.push(width);
+      heights.push(height);
+      widestLabelSize = Math.max(width, widestLabelSize);
+      highestLabelSize = Math.max(height, highestLabelSize);
+    }
+    garbageCollect(caches, length);
+    const widest = widths.indexOf(widestLabelSize);
+    const highest = heights.indexOf(highestLabelSize);
+    const valueAt = idx => ({ width: widths[idx] || 0, height: heights[idx] || 0 });
+    return { first: valueAt(0), last: valueAt(length - 1), widest: valueAt(widest), highest: valueAt(highest), widths: widths, heights: heights };
+  };
+  HScale.prototype._tickSize = function () {
+    const optionTicks = this.options.ticks;
+    const rot = toRadians(this.labelRotation);
+    const cos = Math.abs(Math.cos(rot));
+    const sin = Math.abs(Math.sin(rot));
+    const labelSizes = this._getLabelSizes();
+    const padding = optionTicks.autoSkipPadding || 0;
+    const w = labelSizes ? labelSizes.widest.width + padding : 0;
+    const h = labelSizes ? labelSizes.highest.height + padding : 0;
+    return this.isHorizontal() ? h * cos > w * sin ? w / cos : h / sin : h * sin < w * cos ? h / cos : w / sin;
+  };
+  HScale.prototype.getPixelForValue = function (value) {
+    if (this.type === 'category') {
+      if (typeof value !== 'number') value = this.parse(value);
+      return value === null ? NaN : this.getPixelForDecimal((value - this._startValue) / this._valueRange);
+    }
+    return value === null ? NaN : this.getPixelForDecimal((value - this._startValue) / this._valueRange);
+  };
+  HScale.prototype.getPixelForTick = function (index) {
+    const ticks = this.ticks;
+    if (index < 0 || index > ticks.length - 1) return null;
+    return this.getPixelForValue(ticks[index].value);
+  };
+  HScale.prototype.getPixelForDecimal = function (decimal) {
+    if (this._reversePixels) decimal = 1 - decimal;
+    const pixel = this._startPixel + decimal * this._length;
+    return _int16Range(this._alignToPixels ? _alignPixel(this.chart, pixel, 0) : pixel);
+  };
+  HScale.prototype.getDecimalForPixel = function (pixel) {
+    const decimal = (pixel - this._startPixel) / this._length;
+    return this._reversePixels ? 1 - decimal : decimal;
+  };
+  HScale.prototype.getValueForPixel = function (pixel) {
+    if (this.type === 'category') return Math.round(this._startValue + this.getDecimalForPixel(pixel) * this._valueRange);
+    return this._startValue + this.getDecimalForPixel(pixel) * this._valueRange;
+  };
+  HScale.prototype.getBasePixel = function () { return this.getPixelForValue(this.getBaseValue()); };
+  HScale.prototype.getBaseValue = function () {
+    const min = this.min, max = this.max;
+    return min < 0 && max < 0 ? max : min > 0 && max > 0 ? min : 0;
+  };
+  HScale.prototype.getLineWidthForValue = function (value) {
+    const grid = this.options.grid;
+    if (!this._isVisible() || !grid.display) return 0;
+    const ticks = this.ticks;
+    const index = ticks.findIndex(t => t.value === value);
+    if (index >= 0) return grid.lineWidth;
+    return 0;
+  };
+  HScale.prototype.getLabelForValue = function (value) {
+    if (this.type === 'category') {
+      const labels = this.getLabels();
+      return value >= 0 && value < labels.length ? labels[value] : value;
+    }
+    return numericTickLabel(value, 0, this.ticks);
+  };
+
+  /* ---- stacking + controller min/max (core.datasetController + applyStack) ---- */
+  function applyStack(stack, value, dsIndex, options) {
+    options = options || {};
+    const keys = stack.keys;
+    const singleMode = options.mode === 'single';
+    let i, ilen, datasetIndex, otherValue;
+    if (value === null) return;
+    for (i = 0, ilen = keys.length; i < ilen; ++i) {
+      datasetIndex = +keys[i];
+      if (datasetIndex === dsIndex) {
+        if (options.all) continue;
+        break;
+      }
+      otherValue = stack.values[datasetIndex];
+      if (isNumberFinite(otherValue) && (singleMode || value === 0 || sign(value) === sign(otherValue))) value += otherValue;
+    }
+    return value;
+  }
+  function createStack(canStack, meta, chart) {
+    return canStack && !meta.hidden && meta._stacked && {
+      keys: chart.getSortedDatasetIndices(true),
+      values: null
+    };
+  }
+  function controllerGetMinMax(chart, meta, scale, canStack) {
+    const _parsed = meta._parsed;
+    const sorted = false;
+    const ilen = _parsed.length;
+    const stack = createStack(canStack, meta, chart);
+    const range = { min: INFINITY, max: -INFINITY };
+    let i, parsed;
+    function _skip() { parsed = _parsed[i]; return !isNumberFinite(parsed[scale.axis]); }
+    for (i = 0; i < ilen; ++i) {
+      if (_skip()) continue;
+      updateRangeFromParsed(meta, range, scale, parsed, stack);
+    }
+    return range;
+  }
+  function updateRangeFromParsed(meta, range, scale, parsed, stack) {
+    const parsedValue = parsed[scale.axis];
+    let value = parsedValue === null ? NaN : parsedValue;
+    const values = stack && parsed._stacks[scale.axis];
+    if (stack && values) {
+      stack.values = values;
+      value = applyStack(stack, parsedValue, meta.index);
+    }
+    range.min = Math.min(range.min, value);
+    range.max = Math.max(range.max, value);
+  }
+
+  /* ---- layout (core.layouts) ---- */
+  function filterByPosition(array, position) { return array.filter(v => v.pos === position); }
+  function sortByWeight(array, reverse) {
+    return array.sort((a, b) => {
+      const v0 = reverse ? b : a;
+      const v1 = reverse ? a : b;
+      return v0.weight === v1.weight ? v0.index - v1.index : v0.weight - v1.weight;
+    });
+  }
+  function wrapBoxes(boxes) {
+    const layoutBoxes = [];
+    let i, ilen, box;
+    for (i = 0, ilen = (boxes || []).length; i < ilen; ++i) {
+      box = boxes[i];
+      layoutBoxes.push({
+        index: i,
+        box: box,
+        pos: box.position,
+        horizontal: box.isHorizontal(),
+        weight: box.weight
+      });
+    }
+    return layoutBoxes;
+  }
+  function buildLayoutBoxes(boxes) {
+    const layoutBoxes = wrapBoxes(boxes);
+    const fullSize = sortByWeight(layoutBoxes.filter(wrap => wrap.box.fullSize), true);
+    const left = sortByWeight(filterByPosition(layoutBoxes, 'left'), true);
+    const right = sortByWeight(filterByPosition(layoutBoxes, 'right'));
+    const top = sortByWeight(filterByPosition(layoutBoxes, 'top'), true);
+    const bottom = sortByWeight(filterByPosition(layoutBoxes, 'bottom'));
+    return {
+      fullSize: fullSize,
+      leftAndTop: left.concat(top),
+      rightAndBottom: right.concat(bottom),
+      chartArea: filterByPosition(layoutBoxes, 'chartArea'),
+      vertical: left.concat(right),
+      horizontal: top.concat(bottom)
+    };
+  }
+  function getCombinedMax(maxPadding, chartArea, a, b) {
+    return Math.max(maxPadding[a], chartArea[a]) + Math.max(maxPadding[b], chartArea[b]);
+  }
+  function updateMaxPadding(maxPadding, boxPadding) {
+    maxPadding.top = Math.max(maxPadding.top, boxPadding.top);
+    maxPadding.left = Math.max(maxPadding.left, boxPadding.left);
+    maxPadding.bottom = Math.max(maxPadding.bottom, boxPadding.bottom);
+    maxPadding.right = Math.max(maxPadding.right, boxPadding.right);
+  }
+  function updateDims(chartArea, params, layout) {
+    const pos = layout.pos, box = layout.box;
+    const maxPadding = chartArea.maxPadding;
+    chartArea[pos] -= layout.size || 0;
+    layout.size = layout.horizontal ? box.height : box.width;
+    chartArea[pos] += layout.size;
+    if (box.getPadding) updateMaxPadding(maxPadding, box.getPadding());
+    const newWidth = Math.max(0, params.outerWidth - getCombinedMax(maxPadding, chartArea, 'left', 'right'));
+    const newHeight = Math.max(0, params.outerHeight - getCombinedMax(maxPadding, chartArea, 'top', 'bottom'));
+    const widthChanged = newWidth !== chartArea.w;
+    const heightChanged = newHeight !== chartArea.h;
+    chartArea.w = newWidth;
+    chartArea.h = newHeight;
+    return layout.horizontal ? { same: widthChanged, other: heightChanged } : { same: heightChanged, other: widthChanged };
+  }
+  function handleMaxPadding(chartArea) {
+    const maxPadding = chartArea.maxPadding;
+    function updatePos(pos) {
+      const change = Math.max(maxPadding[pos] - chartArea[pos], 0);
+      chartArea[pos] += change;
+      return change;
+    }
+    chartArea.y += updatePos('top');
+    chartArea.x += updatePos('left');
+    updatePos('right');
+    updatePos('bottom');
+  }
+  function getMargins(horizontal, chartArea) {
+    const maxPadding = chartArea.maxPadding;
+    function marginForPositions(positions) {
+      const margin = { left: 0, top: 0, right: 0, bottom: 0 };
+      positions.forEach(pos => { margin[pos] = Math.max(chartArea[pos], maxPadding[pos]); });
+      return margin;
+    }
+    return horizontal ? marginForPositions(['left', 'right']) : marginForPositions(['top', 'bottom']);
+  }
+  function fitBoxes(boxes, chartArea, params) {
+    const refitBoxes = [];
+    let i, ilen, layout, box, refit, changed;
+    for (i = 0, ilen = boxes.length, refit = 0; i < ilen; ++i) {
+      layout = boxes[i];
+      box = layout.box;
+      box.update(layout.width || chartArea.w, layout.height || chartArea.h, getMargins(layout.horizontal, chartArea));
+      const { same, other } = updateDims(chartArea, params, layout);
+      refit |= same && refitBoxes.length;
+      changed = changed || other;
+      if (!box.fullSize) refitBoxes.push(layout);
+    }
+    return refit && fitBoxes(refitBoxes, chartArea, params) || changed;
+  }
+  function setBoxDims(box, left, top, width, height) {
+    box.top = top;
+    box.left = left;
+    box.right = left + width;
+    box.bottom = top + height;
+    box.width = width;
+    box.height = height;
+  }
+  function placeBoxes(boxes, chartArea, params) {
+    const userPadding = params.padding;
+    let x = chartArea.x, y = chartArea.y;
+    for (const layout of boxes) {
+      const box = layout.box;
+      if (layout.horizontal) {
+        const width = chartArea.w;
+        const height = box.height;
+        setBoxDims(box, chartArea.left, y, width, height);
+        y = box.bottom;
+      } else {
+        const height = chartArea.h;
+        const width = box.width;
+        setBoxDims(box, x, chartArea.top, width, height);
+        x = box.right;
+      }
+    }
+    chartArea.x = x;
+    chartArea.y = y;
+  }
+  function layoutUpdate(chart, width, height, minPadding) {
+    const padding = toPadding(chart.options.layout.padding);
+    const availableWidth = Math.max(width - padding.width, 0);
+    const availableHeight = Math.max(height - padding.height, 0);
+    const boxes = buildLayoutBoxes(chart.boxes);
+    const verticalBoxes = boxes.vertical;
+    const horizontalBoxes = boxes.horizontal;
+    const visibleVerticalBoxCount = verticalBoxes.reduce((total, wrap) => (wrap.box.options && wrap.box.options.display === false ? total : total + 1), 0) || 1;
+    const params = Object.freeze({
+      outerWidth: width,
+      outerHeight: height,
+      padding: padding,
+      availableWidth: availableWidth,
+      availableHeight: availableHeight,
+      vBoxMaxWidth: availableWidth / 2 / visibleVerticalBoxCount,
+      hBoxMaxHeight: availableHeight / 2
+    });
+    const maxPadding = Object.assign({}, padding);
+    updateMaxPadding(maxPadding, toPadding(minPadding));
+    const chartArea = Object.assign({ maxPadding: maxPadding, w: availableWidth, h: availableHeight, x: padding.left, y: padding.top }, padding);
+    const stacks = setLayoutDims(verticalBoxes.concat(horizontalBoxes), params);
+    fitBoxes(boxes.fullSize, chartArea, params);
+    fitBoxes(verticalBoxes, chartArea, params);
+    if (fitBoxes(horizontalBoxes, chartArea, params)) fitBoxes(verticalBoxes, chartArea, params);
+    handleMaxPadding(chartArea);
+    placeBoxes(boxes.leftAndTop, chartArea, params);
+    chartArea.x += chartArea.w;
+    chartArea.y += chartArea.h;
+    placeBoxes(boxes.rightAndBottom, chartArea, params);
+    chart.area = {
+      left: chartArea.left,
+      top: chartArea.top,
+      right: chartArea.left + chartArea.w,
+      bottom: chartArea.top + chartArea.h,
+      height: chartArea.h,
+      width: chartArea.w
+    };
+  }
+  function setLayoutDims(layouts, params) {
+    const vBoxMaxWidth = params.vBoxMaxWidth, hBoxMaxHeight = params.hBoxMaxHeight;
+    let i, ilen, layout;
+    for (i = 0, ilen = layouts.length; i < ilen; ++i) {
+      layout = layouts[i];
+      const fullSize = layout.box.fullSize;
+      if (layout.horizontal) {
+        layout.width = fullSize && params.availableWidth;
+        layout.height = hBoxMaxHeight;
+      } else {
+        layout.width = vBoxMaxWidth;
+        layout.height = fullSize && params.availableHeight;
+      }
+    }
+    return {};
+  }
+
+  /* ---- bar element geometry (core.geometry + controller bar math) ---- */
+  function getAllScaleValues(scale, chart) {
+    const metas = chart.metas, values = [];
+    for (const meta of metas) {
+      for (const parsed of meta._parsed) {
+        const v = parsed[scale.axis];
+        if (isNumberFinite(v)) values.push(v);
+      }
+    }
+    return values;
+  }
+  function computeMinSampleSize(chart, scale) {
+    const values = getAllScaleValues(scale, chart);
+    let min = scale._length;
+    let i, ilen, curr, prev;
+    const updateMinAndPrev = () => {
+      if (curr === 32767 || curr === -32768) return;
+      if (defined(prev)) min = Math.min(min, Math.abs(curr - prev) || min);
+      prev = curr;
+    };
+    for (i = 0, ilen = values.length; i < ilen; ++i) { curr = scale.getPixelForValue(values[i]); updateMinAndPrev(); }
+    prev = undefined;
+    for (i = 0, ilen = scale.ticks.length; i < ilen; ++i) { curr = scale.getPixelForTick(i); updateMinAndPrev(); }
+    return min;
+  }
+  function getStacks(chart, meta, last) {
+    const iScale = meta.iScale;
+    const metasets = iScale.getMatchingVisibleMetas('bar');
+    const stacked = iScale.options.stacked;
+    const stacks = [];
+    for (const m of metasets) {
+      if (stacked === false || stacks.indexOf(m.stack) === -1 || (stacked === undefined && m.stack === undefined)) stacks.push(m.stack);
+      if (m.index === last) break;
+    }
+    if (!stacks.length) stacks.push(undefined);
+    return stacks;
+  }
+  function getStackIndex(chart, meta, datasetIndex, name) {
+    const stacks = getStacks(chart, meta, datasetIndex);
+    const index = name !== undefined ? stacks.indexOf(name) : -1;
+    return index === -1 ? stacks.length - 1 : index;
+  }
+  function computeFitCategoryTraits(index, ruler, rulerSum, stackCount) {
+    const size = ruler.min * 0.8;
+    const ratio = 0.9;
+    return { chunk: size / stackCount, ratio: ratio, start: ruler.pixels[index] - size / 2 };
+    function void0() { return rulerSum; }
+  }
+  function barSign(size, vScale, actualBase) {
+    if (size !== 0) return sign(size);
+    return (vScale.isHorizontal() ? 1 : -1) * (actualBase >= 0 ? 1 : -1);
+  }
+  function calculateBarValuePixels(chart, meta, index) {
+    const vScale = meta.vScale;
+    const actualBase = 0;
+    const parsed = meta._parsed[index];
+    let value = parsed[vScale.axis];
+    let start = 0;
+    let length = meta._stacked ? applyStack({ keys: chart.getSortedDatasetIndices(true), values: parsed._stacks[vScale.axis] }, value, meta.index) : value;
+    let head, size;
+    if (length !== value) {
+      start = length - value;
+      length = value;
+    }
+    const startValue = start;
+    let base = vScale.getPixelForValue(startValue);
+    head = vScale.getPixelForValue(start + length);
+    size = head - base;
+    if (base === vScale.getPixelForValue(actualBase)) {
+      const halfGrid = sign(size) * vScale.getLineWidthForValue(actualBase) / 2;
+      base += halfGrid;
+      size -= halfGrid;
+    }
+    return { size: size, base: base, head: head, center: head + size / 2 };
+  }
+  function calculateBarIndexPixels(chart, meta, index, ruler) {
+    const scale = ruler.scale;
+    const maxBarThickness = INFINITY;
+    let center, size;
+    const stackCount = ruler.stackCount;
+    const range = computeFitCategoryTraits(index, ruler, 0, stackCount);
+    const stackIndex = getStackIndex(chart, meta, meta.index, meta.stack);
+    center = range.start + range.chunk * stackIndex + range.chunk / 2;
+    size = Math.min(maxBarThickness, range.chunk * range.ratio);
+    return { base: center - size / 2, head: center + size / 2, center: center, size: size };
+  }
+  function getRuler(chart, meta) {
+    const iScale = meta.iScale;
+    const pixels = [];
+    let i, ilen;
+    for (i = 0, ilen = meta._parsed.length; i < ilen; ++i) {
+      pixels.push(iScale.getPixelForValue(meta._parsed[i][iScale.axis], i));
+    }
+    return {
+      min: computeMinSampleSize(chart, iScale),
+      pixels: pixels,
+      start: iScale._startPixel,
+      end: iScale._endPixel,
+      stackCount: getStacks(chart, meta).length,
+      scale: iScale
+    };
+  }
+  function barElement(chart, meta, index) {
+    const vScale = meta.vScale;
+    const base = vScale.getBasePixel();
+    const ruler = meta._ruler;
+    const parsed = meta._parsed[index];
+    const vpixels = isNullOrUndef(parsed[vScale.axis]) ? { base: base, head: base } : calculateBarValuePixels(chart, meta, index);
+    const ipixels = calculateBarIndexPixels(chart, meta, index, ruler);
+    return {
+      horizontal: false,
+      base: vpixels.base,
+      x: ipixels.center,
+      y: vpixels.head,
+      height: Math.abs(vpixels.size),
+      width: ipixels.size
+    };
+  }
+  function barBounds(bar) {
+    const half = bar.width / 2;
+    return { left: bar.x - half, right: bar.x + half, top: Math.min(bar.y, bar.base), bottom: Math.max(bar.y, bar.base) };
+  }
+
+  /* ---- the chart ---- */
+  const SVGNS = 'http://www.w3.org/2000/svg';
+  function el(name, attrs, parent) {
+    const e = document.createElementNS(SVGNS, name);
+    if (attrs) for (const k in attrs) e.setAttribute(k, attrs[k]);
+    if (parent) parent.appendChild(e);
+    return e;
+  }
+  const fmt = n => {
+    if (!isFinite(n)) return '0';
+    const r = Math.round(n * 1e6) / 1e6;
+    return String(r);
+  };
+
+  function HChart(wrap, cfg) {
+    this.cfg = cfg || {};
+    this.host = wrap;
+    this.options = { layout: { padding: this.cfg.layoutPadding || 0 } };
+    this.width = this.height = 0;
+    this.area = null;
+    this._clipId = 'hclip-' + (HChart._seq = (HChart._seq || 0) + 1);
+    this.metas = [];
+    this.scales = {};
+    this.boxes = [];
+    this.font = DEFAULT_FONT;
+    this.currentDevicePixelRatio = Math.max(2, window.devicePixelRatio || 1);
+    this.hovered = null;
+    this.ttEl = null;
+    this.ttShown = false;
+    this.initDOM(wrap);
+    this.render();
+  }
+  HChart.prototype.isPointInArea = function (point) { return _isPointInArea(point, this.area); };
+  HChart.prototype.getSortedDatasetIndices = function () {
+    return this.metas.map(m => m.index);
+  };
+  HChart.prototype.initDOM = function (wrap) {
+    this.box = document.createElement('div');
+    this.box.style.cssText = 'position:relative;width:100%;height:100%;';
+    wrap.appendChild(this.box);
+    this.svg = el('svg', null, this.box);
+    this.svg.style.display = 'block';
+    this.ttEl = document.createElement('div');
+    this.ttEl.style.cssText = 'position:absolute;display:none;pointer-events:none;background:#fff;border:1px solid #e4e4e4;border-radius:6px;padding:10px;z-index:10;box-sizing:border-box;';
+    this.box.appendChild(this.ttEl);
+    this.bindEvents();
+  };
+  HChart.prototype.resize = function () { this.render(); };
+  HChart.prototype.getChartAreaTop = function () { return this.area ? this.area.top : 0; };
+  HChart.prototype.chartArea = function () { return this.area; };
+  HChart.prototype.update = function () { this.render(); };
+  HChart.prototype.render = function () {
+    const w = Math.floor(this.box.clientWidth || this.box.offsetWidth || 0);
+    const h = Math.floor(this.box.clientHeight || this.box.offsetHeight || 0);
+    if (!w || !h) return;
+    this.width = w; this.height = h;
+    this.svg.setAttribute('width', w);
+    this.svg.setAttribute('height', h);
+    this.svg.setAttribute('viewBox', '0 0 ' + w + ' ' + h);
+    this.svg.style.width = w + 'px';
+    this.svg.style.height = h + 'px';
+    this.buildModel();
+    // chart.js Chart.update: minPadding = layout.autoPadding ? max(dataset overflow) : 0
+    // (end-point halos + dataset border half-widths reserve layout margin).
+    let minPad = 0;
+    for (const meta of this.metas) {
+      if (meta.type !== 'line') continue; // other controllers in chart.js 4.4.1 report false/0
+      const ds = meta.ds;
+      const border = ds.borderWidth || 0;
+      const n = (ds.data || []).length;
+      if (!n) { minPad = Math.max(border, minPad); continue; }
+      const pbw = ds.pointBorderWidth !== undefined ? ds.pointBorderWidth : ds.borderWidth;
+      const r0 = ds.pointRadius || 0;
+      const r = Math.max(r0, r0 && ds.pointHoverRadius || 0); // chart.js PointElement.size()
+      const bw = r && pbw || 0;
+      minPad = Math.max(Math.max(border, (r + bw) * 2) / 2, minPad);
+    }
+    const autoPadding = !(this.options && this.options.layout && this.options.layout.autoPadding === false);
+    layoutUpdate(this, w, h, autoPadding ? minPad : 0);
+    for (const box of this.boxes) box.configure();
+    this.computeElements();
+    this.draw();
+    this.hovered = null;
+    this.hideTip();
+  };
+  HChart.prototype.buildModel = function () {
+    _chartStacks.delete(this);
+    const cfg = this.cfg;
+    const data = this.data = cfg.data ? Object.assign({}, cfg.data, { labels: cfg.labels }) : { labels: cfg.labels };
+    const scales = this.scales = {};
+    this.boxes = [];
+    for (const so of cfg.scaleDefs) {
+      const s = new HScale(this, so);
+      s.id = so.id;
+      scales[so.id] = s;
+      this.boxes.push(s);
+    }
+    this.scaleList = cfg.scaleDefs.map(function (sd) { return scales[sd.id]; });
+    const x = scales.x;
+    this.metas = cfg.datasets.map((ds, i) => {
+      const iScale = x, vScale = scales[ds.yAxisID || 'y'];
+      const parsed = new Array(data.labels.length);
+      for (let j = 0; j < data.labels.length; j++) parsed[j] = { x: j, y: ds.data[j] === undefined ? null : ds.data[j] };
+      const stacked = vScale.options.stacked !== undefined ? !!vScale.options.stacked : ds.stack !== undefined;
+      const meta = {
+        index: i,
+        type: ds.type,
+        xScale: iScale,
+        vScale: vScale,
+        iScale: iScale,
+        xAxisID: 'x',
+        yAxisID: ds.yAxisID || 'y',
+        stack: ds.stack,
+        _parsed: parsed,
+        _stacked: stacked,
+        ds: ds
+      };
+      return meta;
+    });
+    // stack values per index (updateStacks): keys x.y.<stack>, indices ds->value
+    for (const meta of this.metas) {
+      if (!meta._stacked) continue;
+      const axis = meta.vScale.axis;
+      for (let i = 0; i < meta._parsed.length; i++) {
+        const p = meta._parsed[i];
+        const itemStacks = p._stacks || (p._stacks = {});
+        const stackBox = itemStacks[axis] = chart_stack_get(this, meta, p.x);
+        stackBox[meta.index] = p.y;
+      }
+    }
+  };
+  const _chartStacks = new WeakMap();
+  function chart_stack_get(chart, meta, indexValue) {
+    let stacks = _chartStacks.get(chart);
+    if (!stacks) _chartStacks.set(chart, stacks = {});
+    const key = 'x.' + meta.vScale.id + '.' + meta.ds.stack;
+    const sub = stacks[key] || (stacks[key] = {});
+    return sub[indexValue] || (sub[indexValue] = {});
+  }
+  HChart.prototype._clearStacks = function () { _chartStacks.delete(this); };
+  HChart.prototype.computeElements = function () {
+    const chartArea = this.area;
+    for (const meta of this.metas) {
+      if (meta.type === 'bar') {
+        meta._ruler = getRuler(this, meta);
+        meta.elements = meta._parsed.map((p, i) => barElement(this, meta, i));
+      } else {
+        const vs = meta.vScale, xs = meta.iScale;
+        const pts = meta._parsed.map(p => {
+          const nullData = isNullOrUndef(p.y);
+          const x = xs.getPixelForValue(p.x);
+          let vpx = nullData ? vs.getBasePixel() : vs.getPixelForValue(meta._stacked ? applyStack({ keys: this.getSortedDatasetIndices(true), values: p._stacks && p._stacks[vs.axis] }, p.y, meta.index) : p.y, p.x);
+          const skip = isNaN(x) || isNaN(vpx) || nullData;
+          return { x: x, y: vpx, skip: skip, parsed: p };
+        });
+        meta.elements = pts;
+        dsUpdateBezier(pts, meta.ds, chartArea);
+        // measure segments for drawing: split between non-skip points
+        let path = '';
+        let move = true;
+        let prev = null;
+        if (meta.ds.spanGaps) {
+          const list = pts.filter(pt => !pt.skip);
+          if (list.length) {
+            path = 'M ' + fmt(list[0].x) + ' ' + fmt(list[0].y);
+            prev = list[0];
+            for (let i = 1; i < list.length; i++) {
+              const t = list[i];
+              path += ' C ' + fmt(prev.cp2x) + ' ' + fmt(prev.cp2y) + ' ' + fmt(t.cp1x) + ' ' + fmt(t.cp1y) + ' ' + fmt(t.x) + ' ' + fmt(t.y);
+              prev = t;
+            }
+          }
+        } else {
+          prev = null;
+          for (const t of pts) {
+            if (t.skip) { move = true; prev = null; continue; }
+            if (move || !prev) { path += ' M ' + fmt(t.x) + ' ' + fmt(t.y); move = false; }
+            else path += ' C ' + fmt(prev.cp2x) + ' ' + fmt(prev.cp2y) + ' ' + fmt(t.cp1x) + ' ' + fmt(t.cp1y) + ' ' + fmt(t.x) + ' ' + fmt(t.y);
+            prev = t;
+          }
+        }
+        meta._path = path;
+      }
+    }
+  };
+  function dsUpdateBezier(pts, ds, chartArea) {
+    const filtered = ds.spanGaps ? pts.filter(pt => !pt.skip) : pts;
+    if (!filtered.length) return;
+    _updateBezierControlPoints(pts, { spanGaps: ds.spanGaps, tension: ds.tension, capBezierPoints: true }, chartArea, null, 'x');
+  }
+
+  /* ---- scale drawing helpers (core.scale draw family) ---- */
+  const offsetFromEdge = (scale, edge, offset) => edge === 'top' || edge === 'left' ? scale[edge] + offset : scale[edge] - offset;
+  const _toLeftRightCenter = align => align === 'start' ? 'left' : align === 'end' ? 'right' : 'center';
+  const reverseAlign = align => align === 'left' ? 'right' : align === 'right' ? 'left' : align;
+  const _alignStartEnd = (align, start, end) => align === 'start' ? start : align === 'end' ? end : (start + end) / 2;
+  function titleAlign(align, position, reverse) {
+    let ret = _toLeftRightCenter(align);
+    if (reverse && position !== 'right' || !reverse && position === 'right') ret = reverseAlign(ret);
+    return ret;
+  }
+  function titleArgs(scale, offset, position, align) {
+    const top = scale.top, left = scale.left, bottom = scale.bottom, right = scale.right;
+    const chartArea = scale.chart.chartArea;
+    let rotation = 0, maxWidth, titleX, titleY;
+    const height = bottom - top;
+    const width = right - left;
+    if (scale.isHorizontal()) {
+      titleX = _alignStartEnd(align, left, right);
+      titleY = position === 'center' ? (chartArea.bottom + chartArea.top) / 2 + height - offset : offsetFromEdge(scale, position, offset);
+      maxWidth = right - left;
+    } else {
+      titleX = position === 'center' ? (chartArea.left + chartArea.right) / 2 - width + offset : offsetFromEdge(scale, position, offset);
+      titleY = _alignStartEnd(align, bottom, top);
+      rotation = position === 'left' ? -HALF_PI : HALF_PI;
+    }
+    return { titleX: titleX, titleY: titleY, maxWidth: maxWidth, rotation: rotation };
+  }
+  function getPixelForGridLine(scale, index, offsetGridLines) {
+    const length = scale.ticks.length;
+    const validIndex = Math.min(index, length - 1);
+    const start = scale._startPixel, end = scale._endPixel;
+    const epsilon = 1e-6;
+    let lineValue = scale.getPixelForTick(validIndex);
+    let offset;
+    if (offsetGridLines) {
+      if (length === 1) offset = Math.max(lineValue - start, end - lineValue);
+      else if (index === 0) offset = (scale.getPixelForTick(1) - lineValue) / 2;
+      else offset = (lineValue - scale.getPixelForTick(validIndex - 1)) / 2;
+      lineValue += validIndex < index ? offset : -offset;
+      if (lineValue < start - epsilon || lineValue > end + epsilon) return;
+    }
+    return lineValue;
+  }
+  HScale.prototype._computeGridLineItems = function (chartArea) {
+    const chart = this.chart;
+    const options = this.options;
+    const grid = options.grid, position = options.position, border = options.border;
+    const offset = grid.offset;
+    const isHorizontal = this.isHorizontal();
+    const ticks = this.ticks;
+    const ticksLength = ticks.length + (offset ? 1 : 0);
+    const tl = getTickMarkLength(grid);
+    const items = [];
+    const axisWidth = border.display ? border.width : 0;
+    const axisHalfWidth = axisWidth / 2;
+    const alignBorderValue = (pixel) => _alignPixel(chart, pixel, axisWidth);
+    let borderValue, i, lineValue, alignedLineValue;
+    let tx1, ty1, tx2, ty2, x1, y1, x2, y2;
+    if (position === 'bottom') {
+      borderValue = alignBorderValue(this.top);
+      y1 = chartArea.top;
+      y2 = alignBorderValue(chartArea.bottom) - axisHalfWidth;
+      ty1 = borderValue + axisHalfWidth;
+      ty2 = this.top + tl;
+    } else if (position === 'top') {
+      borderValue = alignBorderValue(this.bottom);
+      ty1 = this.bottom - tl;
+      ty2 = borderValue - axisHalfWidth;
+      y1 = alignBorderValue(chartArea.top) + axisHalfWidth;
+      y2 = chartArea.bottom;
+    } else if (position === 'left') {
+      borderValue = alignBorderValue(this.right);
+      tx1 = this.right - tl;
+      tx2 = borderValue - axisHalfWidth;
+      x1 = alignBorderValue(chartArea.left) + axisHalfWidth;
+      x2 = chartArea.right;
+    } else {
+      borderValue = alignBorderValue(this.left);
+      x1 = chartArea.left;
+      x2 = alignBorderValue(chartArea.right) - axisHalfWidth;
+      tx1 = borderValue + axisHalfWidth;
+      tx2 = this.left + tl;
+    }
+    const limit = valueOrDefault(options.ticks.maxTicksLimit, ticksLength);
+    const step = Math.max(1, Math.ceil(ticksLength / limit));
+    for (i = 0; i < ticksLength; i += step) {
+      lineValue = getPixelForGridLine(this, i, offset);
+      if (lineValue === undefined) continue;
+      alignedLineValue = _alignPixel(chart, lineValue, grid.lineWidth);
+      if (isHorizontal) { tx1 = tx2 = x1 = x2 = alignedLineValue; }
+      else { ty1 = ty2 = y1 = y2 = alignedLineValue; }
+      items.push({
+        tx1: tx1, ty1: ty1, tx2: tx2, ty2: ty2,
+        x1: x1, y1: y1, x2: x2, y2: y2,
+        width: grid.lineWidth,
+        color: grid.color,
+        tickWidth: grid.tickWidth,
+        tickColor: grid.tickColor
+      });
+    }
+    this._ticksLength = ticksLength;
+    this._borderValue = borderValue;
+    return items;
+  };
+  HScale.prototype.drawGrid = function (g, chartArea) {
+    const grid = this.options.grid;
+    const items = this._gridLineItems || (this._gridLineItems = this._computeGridLineItems(chartArea));
+    if (!grid.display) return;
+    for (const item of items) {
+      if (grid.drawOnChartArea && item.width && item.color) {
+        el('line', { x1: fmt(item.x1), y1: fmt(item.y1), x2: fmt(item.x2), y2: fmt(item.y2), stroke: item.color, 'stroke-width': item.width }, g);
+      }
+      if (grid.drawTicks && item.tickWidth && item.tickColor) {
+        el('line', { x1: fmt(item.tx1), y1: fmt(item.ty1), x2: fmt(item.tx2), y2: fmt(item.ty2), stroke: item.tickColor, 'stroke-width': item.tickWidth }, g);
+      }
+    }
+  };
+  HScale.prototype.drawBorder = function (g) {
+    const chart = this.chart, options = this.options;
+    const border = options.border, grid = options.grid;
+    const axisWidth = border.display ? border.width : 0;
+    if (!axisWidth) return;
+    const lastLineWidth = grid.display ? grid.lineWidth : 0;
+    const borderValue = this._borderValue;
+    let x1, x2, y1, y2;
+    if (this.isHorizontal()) {
+      x1 = _alignPixel(chart, this.left, axisWidth) - axisWidth / 2;
+      x2 = _alignPixel(chart, this.right, lastLineWidth) + lastLineWidth / 2;
+      y1 = y2 = borderValue;
+    } else {
+      y1 = _alignPixel(chart, this.top, axisWidth) - axisWidth / 2;
+      y2 = _alignPixel(chart, this.bottom, lastLineWidth) + lastLineWidth / 2;
+      x1 = x2 = borderValue;
+    }
+    el('line', { x1: fmt(x1), y1: fmt(y1), x2: fmt(x2), y2: fmt(y2), stroke: border.color, 'stroke-width': border.width }, g);
+  };
+  HScale.prototype._getYAxisLabelAlignment = function (tl) {
+    const position = this.options.position, ticks = this.options.ticks;
+    const labelSizes = this._getLabelSizes();
+    const tickAndPadding = tl + ticks.padding;
+    const widest = labelSizes.widest.width;
+    let textAlign, x;
+    if (position === 'left') {
+      x = this.right - tickAndPadding;
+      if (ticks.crossAlign === 'near') textAlign = 'right';
+      else if (ticks.crossAlign === 'center') { textAlign = 'center'; x -= widest / 2; }
+      else { textAlign = 'left'; x = this.left; }
+    } else {
+      x = this.left + tickAndPadding;
+      if (ticks.crossAlign === 'near') textAlign = 'left';
+      else if (ticks.crossAlign === 'center') { textAlign = 'center'; x += widest / 2; }
+      else { textAlign = 'right'; x = this.right; }
+    }
+    return { textAlign: textAlign, x: x };
+  };
+  HScale.prototype._computeLabelItems = function (chartArea) {
+    const options = this.options;
+    const position = options.position, optionTicks = options.ticks;
+    const isHorizontal = this.isHorizontal();
+    const ticks = this.ticks;
+    const tl = getTickMarkLength(options.grid);
+    const tickAndPadding = tl + optionTicks.padding;
+    const rotation = -toRadians(this.labelRotation);
+    const items = [];
+    let i, ilen, tick, label, x, y, textAlign, pixel, font, lineHeight, textOffset;
+    if (position === 'top') { y = this.bottom - tickAndPadding; textAlign = 'center'; }
+    else if (position === 'bottom') { y = this.top + tickAndPadding; textAlign = 'center'; }
+    else { const ret = this._getYAxisLabelAlignment(tl); textAlign = ret.textAlign; x = ret.x; }
+    const labelSizes = this._getLabelSizes();
+    for (i = 0, ilen = ticks.length; i < ilen; ++i) {
+      tick = ticks[i];
+      label = tick.label;
+      pixel = this.getPixelForTick(i) + optionTicks.labelOffset;
+      font = this._resolveTickFontOptions(i);
+      lineHeight = font.lineHeight;
+      const lineCount = isArray(label) ? label.length : 1;
+      if (isHorizontal) {
+        x = pixel;
+        if (position === 'top') textOffset = optionTicks.crossAlign === 'near' || rotation !== 0 ? -lineCount * lineHeight + lineHeight / 2 : (optionTicks.crossAlign === 'center' ? -labelSizes.highest.height / 2 - lineCount / 2 * lineHeight + lineHeight : -labelSizes.highest.height + lineHeight / 2);
+        else textOffset = optionTicks.crossAlign === 'near' || rotation !== 0 ? lineHeight / 2 : (optionTicks.crossAlign === 'center' ? labelSizes.highest.height / 2 - lineCount / 2 * lineHeight : labelSizes.highest.height - lineCount * lineHeight);
+        if (rotation !== 0) x += lineHeight / 2 * Math.sin(rotation);
+      } else {
+        y = pixel;
+        textOffset = (1 - lineCount) * lineHeight / 2;
+      }
+      items.push({ x: x, y: y, textOffset: textOffset, rotation: rotation, textAlign: textAlign, label: label, font: font, color: optionTicks.color });
+    }
+    this._labelItems = items;
+    return items;
+  };
+  const ANCHOR = { left: 'start', center: 'middle', right: 'end' };
+  function drawTickText(g, item) {
+    const labels = isArray(item.label) ? item.label : [item.label];
+    for (let li = 0; li < labels.length; li++) {
+      if (labels[li] === '' || labels[li] === undefined || labels[li] === null) continue;
+      const y = item.y + item.textOffset + li * item.font.lineHeight;
+      const t = el('text', {
+        x: fmt(item.x), y: fmt(y),
+        'font-size': item.font.size,
+        'font-family': item.font.family,
+        'font-weight': item.font.weight || 'normal',
+        fill: item.color,
+        'text-anchor': ANCHOR[item.textAlign] || 'middle',
+        'dominant-baseline': 'central'
+      }, g);
+      if (item.rotation) t.setAttribute('transform', 'rotate(' + (-toDegrees(item.rotation)) + ' ' + fmt(item.x) + ' ' + fmt(y) + ')');
+      t.textContent = labels[li];
+    }
+  }
+  HScale.prototype.drawLabels = function (g, chartArea) {
+    if (!this.options.ticks.display) return;
+    const items = this._labelItems || this._computeLabelItems(chartArea);
+    for (const item of items) drawTickText(g, item);
+  };
+  HScale.prototype.drawTitle = function (g) {
+    const options = this.options;
+    const position = options.position, title = options.title, reverse = options.reverse;
+    if (!title || !title.display) return;
+    const font = toFont(title.font, this.chart.font);
+    const padding = toPadding(title.padding);
+    const align = title.align || 'center';
+    let offset = font.lineHeight / 2;
+    if (position === 'bottom' || position === 'center') {
+      offset += padding.bottom;
+      if (isArray(title.text)) offset += font.lineHeight * (title.text.length - 1);
+    } else offset += padding.top;
+    const a = titleArgs(this, offset, position, align);
+    const texts = isArray(title.text) ? title.text : [title.text];
+    for (let li = 0; li < texts.length; li++) {
+      const y = a.titleY + (this.isHorizontal() ? (li - (texts.length - 1)) * font.lineHeight : li * font.lineHeight);
+      const t = el('text', {
+        x: fmt(a.titleX), y: fmt(y),
+        'font-size': font.size, 'font-family': font.family, 'font-weight': font.weight || 'bold',
+        fill: title.color || this.options.color,
+        'text-anchor': ANCHOR[titleAlign(align, position, reverse)],
+        'dominant-baseline': 'central'
+      }, g);
+      if (a.rotation) t.setAttribute('transform', 'rotate(' + (-toDegrees(a.rotation)) + ' ' + fmt(a.titleX) + ' ' + fmt(y) + ')');
+      t.textContent = texts[li];
+    }
+  };
+
+  /* ---- chart draw ---- */
+  HChart.prototype.draw = function () {
+    const svg = this.svg;
+    while (svg.firstChild) svg.removeChild(svg.firstChild);
+    const ca = this.area;
+    const scaleList = this.scaleList;
+    const gGrid = el('g', null, svg);
+    const gTitle = el('g', null, svg);
+    const gBorder = el('g', null, svg);
+    for (const s of scaleList) {
+      if (!s._isVisible()) continue;
+      s.drawGrid(gGrid, ca);
+      s.drawTitle(gTitle);
+      s.drawBorder(gBorder);
+      s.drawLabels(gBorder, ca);
+    }
+    const cid = this._clipId;
+    const cp = el('clipPath', { id: cid }, svg);
+    el('rect', { x: fmt(ca.left), y: fmt(ca.top), width: fmt(ca.right - ca.left), height: fmt(ca.bottom - ca.top) }, cp);
+    const gData = el('g', { 'clip-path': 'url(#' + cid + ')' }, svg);
+    for (const meta of this.metas) {
+      const ds = meta.ds;
+      if (meta.type === 'bar') {
+        meta._rects = [];
+        for (let i = 0; i < meta.elements.length; i++) {
+          const b = meta.elements[i];
+          if (!b || isNaN(b.x) || isNaN(b.y) || isNaN(b.base)) { meta._rects.push(null); continue; }
+          const r = el('rect', {
+            x: fmt(b.x - b.width / 2),
+            y: fmt(Math.min(b.y, b.base)),
+            width: fmt(Math.max(b.width, 0)),
+            height: fmt(Math.abs(b.base - b.y)),
+            fill: ds.backgroundColor
+          }, gData);
+          meta._rects.push(r);
+        }
+      } else {
+        el('path', {
+          d: meta._path, fill: 'none',
+          stroke: ds.borderColor, 'stroke-width': ds.borderWidth,
+          'stroke-linecap': 'butt', 'stroke-linejoin': 'round'
+        }, gData);
+        meta._points = [];
+        for (let i = 0; i < meta.elements.length; i++) {
+          const p = meta.elements[i];
+          if (p.skip || !(ds.pointRadius > 0)) { meta._points.push(null); continue; }
+          const c = el('circle', {
+            cx: fmt(p.x), cy: fmt(p.y), r: fmt(Math.max(ds.pointRadius, 0.3)),
+            fill: ds.pointBackgroundColor || ds.backgroundColor,
+            stroke: ds.pointBorderColor || ds.borderColor,
+            'stroke-width': 1
+          }, gData);
+          meta._points.push(c);
+        }
+      }
+    }
+    if (this.cfg.chartBox) {
+      el('rect', {
+        x: fmt(ca.left + 0.5), y: fmt(ca.top + 0.5),
+        width: fmt(ca.right - ca.left - 1), height: fmt(ca.bottom - ca.top - 1),
+        fill: 'none', stroke: this.cfg.chartBoxColor, 'stroke-width': 1
+      }, gData);
+    }
+  };
+
+  /* ---- interaction ---- */
+  function elemCenter(el2, meta) {
+    return { x: el2.x, y: el2.y };
+  }
+  function barTooltipPosition(b) { return { x: b.x, y: b.y }; }
+  HChart.prototype.getElementsAtEventForMode = function (pos, mode, opts) {
+    opts = opts || {};
+    const intersect = !!opts.intersect;
+    if (!this.isPointInArea(pos) && !intersect) return [];
+    const out = [];
+    if (mode === 'index' && !intersect) {
+      // nearest along x, then every dataset's element at that index
+      let minDist = INFINITY, bestIndex = -1;
+      for (const meta of this.metas) {
+        for (let i = 0; i < meta.elements.length; i++) {
+          const e2 = meta.elements[i];
+          if (!e2 || e2.skip) continue;
+          const c = elemCenter(e2, meta);
+          if (isNaN(c.x) || isNaN(c.y)) continue;
+          const d = Math.abs(pos.x - c.x);
+          if (d < minDist) { minDist = d; bestIndex = i; }
+        }
+      }
+      if (bestIndex < 0) return [];
+      for (const meta of this.metas) {
+        const e2 = meta.elements[bestIndex];
+        if (e2 && !e2.skip) out.push({ element: e2, datasetIndex: meta.index, index: bestIndex });
+      }
+      return out;
+    }
+    // nearest with optional intersect (used by click retarget)
+    let minD = INFINITY, best = null;
+    for (const meta of this.metas) {
+      for (let i = 0; i < meta.elements.length; i++) {
+        const e2 = meta.elements[i];
+        if (!e2 || e2.skip) continue;
+        let inRange;
+        let cx, cy;
+        if (meta.type === 'bar') {
+          const bb = barBounds(e2);
+          inRange = pos.x >= bb.left && pos.x <= bb.right && pos.y >= bb.top && pos.y <= bb.bottom;
+          cx = e2.x; cy = e2.y;
+        } else {
+          const hr = 1;
+          inRange = distanceBetweenPoints(pos, e2) <= Math.max(0, e2.r || 0) + hr + 1;
+          cx = e2.x; cy = e2.y;
+        }
+        if (intersect && !inRange) continue;
+        const d = distanceBetweenPoints(pos, { x: cx, y: cy });
+        if (d < minD) { minD = d; best = { element: e2, datasetIndex: meta.index, index: i }; }
+      }
+    }
+    if (best) out.push(best);
+    return out;
+  };
+  HChart.prototype._elemTip = function (e2, meta) {
+    if (meta.type === 'bar') return barTooltipPosition(e2);
+    return { x: e2.x, y: e2.y };
+  };
+  HChart.prototype._updateHover = function (active) {
+    // clear previous
+    for (const meta of this.metas) {
+      if (meta.type !== 'bar' && meta._hoveredIndex !== undefined && meta._hoveredIndex !== null) {
+        const prevEl = meta._points && meta._points[meta._hoveredIndex];
+        if (prevEl) {
+          prevEl.setAttribute('r', fmt(Math.max(meta.ds.pointRadius, 0.3)));
+          if (!(meta.ds.pointRadius > 0)) prevEl.setAttribute('display', 'none');
+        }
+      }
+      meta._hoveredIndex = null;
+    }
+    for (const a of active) {
+      const meta = this.metas[a.datasetIndex];
+      if (meta.type !== 'bar') {
+        const p = meta.elements[a.index];
+        if (p.skip) continue;
+        const hoverR = meta.ds.pointHoverRadius !== undefined ? meta.ds.pointHoverRadius : 4;
+        const r = Math.max(meta.ds.pointRadius || 0, hoverR);
+        let cel = meta._points[a.index];
+        if (!cel) {
+          cel = el('circle', {
+            cx: fmt(p.x), cy: fmt(p.y),
+            fill: meta.ds.pointBackgroundColor || meta.ds.backgroundColor,
+            stroke: meta.ds.pointBorderColor || meta.ds.borderColor,
+            'stroke-width': 1
+          }, this.svg.lastChild);
+          meta._points[a.index] = cel;
+        }
+        cel.setAttribute('display', '');
+        cel.setAttribute('r', fmt(Math.max(r, 0.3)));
+        meta._hoveredIndex = a.index;
+      }
+    }
+  };
+
+  /* ---- tooltip (plugin.tooltip 4.4.1 + page tooltipCfg) ---- */
+  function ttDefaults() {
+    return {
+      enabled: true, position: 'average', backgroundColor: 'rgba(0,0,0,0.8)',
+      titleColor: '#fff', titleFont: { weight: 'bold' }, titleSpacing: 2, titleMarginBottom: 6,
+      bodyColor: '#fff', bodySpacing: 2, bodyFont: {}, padding: 6,
+      caretPadding: 2, caretSize: 5, cornerRadius: 6, multiKeyBackground: '#fff',
+      displayColors: true, boxPadding: 0, borderColor: 'rgba(0,0,0,0)', borderWidth: 0,
+      usePointStyle: false, filter: null, callbacks: null
+    };
+  }
+  function ttSize(chart, o, titleLines, rows) {
+    const ctx = getMeasCtx();
+    const bodyFont = toFont(o.bodyFont, DEFAULT_FONT);
+    const titleFont = toFont(o.titleFont, DEFAULT_FONT);
+    const boxWidth = bodyFont.size, boxHeight = bodyFont.size;
+    const padding = toPadding(o.padding);
+    let height = padding.height, width = 0;
+    if (titleLines.length) height += titleLines.length * titleFont.lineHeight + (titleLines.length - 1) * o.titleSpacing + o.titleMarginBottom;
+    const n = rows.length;
+    if (n) {
+      const blh = o.displayColors ? Math.max(boxHeight, bodyFont.lineHeight) : bodyFont.lineHeight;
+      height += n * blh + (n - 1) * o.bodySpacing;
+    }
+    const pad0 = 0;
+    ctx.font = FONT_STRING(titleFont);
+    for (const t of titleLines) width = Math.max(width, ctx.measureText(t).width + pad0);
+    const wp = o.displayColors ? boxWidth + 2 + o.boxPadding : 0;
+    ctx.font = FONT_STRING(bodyFont);
+    for (const r of rows) width = Math.max(width, ctx.measureText(r.text).width + wp);
+    width += padding.width;
+    return { width: width, height: height, boxWidth: boxWidth, boxHeight: boxHeight, bodyFont: bodyFont, titleFont: titleFont };
+  }
+  const ttToTRBLCorners = r => { r = Math.min(r || 0, 1e9); return { topLeft: r, topRight: r, bottomLeft: r, bottomRight: r }; };
+  function ttAlign(x, width, o, chartW, yAlign, size) {
+    const caret = o.caretSize + o.caretPadding;
+    let xAlign = 'center';
+    if (yAlign === 'center') xAlign = x <= (0 + chartW) / 2 ? 'left' : 'right';
+    else if (x <= width / 2) xAlign = 'left';
+    else if (x >= chartW - width / 2) xAlign = 'right';
+    if (xAlign === 'left' && x + width + caret > chartW) xAlign = 'center';
+    if (xAlign === 'right' && x - width - caret < 0) xAlign = 'center';
+    return xAlign;
+  }
+  function ttBgPoint(o, size, alignment, chart) {
+    const caretSize = o.caretSize, caretPadding = o.caretPadding, cornerRadius = o.cornerRadius;
+    const xAlign = alignment.xAlign, yAlign = alignment.yAlign;
+    const paddingAndSize = caretSize + caretPadding;
+    const corners = ttToTRBLCorners(cornerRadius);
+    let x = size.x;
+    if (xAlign === 'right') x -= size.width; else if (xAlign === 'center') x -= size.width / 2;
+    let y = size.y;
+    if (yAlign === 'top') y += paddingAndSize;
+    else if (yAlign === 'bottom') y -= size.height + paddingAndSize;
+    else y -= size.height / 2;
+    if (yAlign === 'center') {
+      if (xAlign === 'left') x += paddingAndSize;
+      else if (xAlign === 'right') x -= paddingAndSize;
+    } else if (xAlign === 'left') x -= Math.max(corners.topLeft, corners.bottomLeft) + caretSize;
+    else if (xAlign === 'right') x += Math.max(corners.topRight, corners.bottomRight) + caretSize;
+    return {
+      x: Math.max(Math.min(x, chart.width - size.width), 0),
+      y: Math.max(Math.min(y, chart.height - size.height), 0)
+    };
+  }
+  HChart.prototype.showTip = function (active, eventX, eventY) {
+    const o = this.cfg.ttOpts;
+    if (!o.enabled) { this.hideTip(); return; }
+    if (!active.length) { this.hideTip(); return; }
+    const items = [];
+    for (const a of active) {
+      const meta = this.metas[a.datasetIndex];
+      const parsed = meta._parsed[a.index];
+      items.push({
+        chart: this,
+        label: meta.iScale.getLabelForValue(parsed.x),
+        parsed: parsed,
+        raw: meta.ds.data[a.index],
+        formattedValue: meta.vScale.getLabelForValue(parsed.y),
+        dataset: meta.ds,
+        dataIndex: a.index,
+        datasetIndex: a.datasetIndex,
+        element: a.element
+      });
+    }
+    let shown = items;
+    if (o.filter) shown = items.filter(it => o.filter(it));
+    if (!shown.length) { this.hideTip(); return; }
+    const cbs = o.callbacks || {};
+    const titleFn = cbs.title || (its => its.length ? its[0].label : '');
+    let title = titleFn(shown);
+    title = title === undefined || title === null ? '' : Array.isArray(title) ? title : [String(title)];
+    const labelFn = cbs.label || (item => {
+      let l = item.dataset.label || '';
+      if (l) l += ': ';
+      if (item.parsed.y !== null && item.parsed.y !== undefined) l += item.formattedValue;
+      return l;
+    });
+    const rows = shown.map(it => ({
+      text: labelFn(it),
+      bg: it.element.bg || it.dataset.backgroundColor,
+      border: it.element.border || it.dataset.borderColor || it.dataset.backgroundColor
+    }));
+    if (!title.length && !rows.length) { this.hideTip(); return; }
+    // average positioner over ACTIVE elements (Chart.js uses active, not filtered)
+    let sx = 0, sy = 0, cnt = 0;
+    for (const a of active) {
+      const meta = this.metas[a.datasetIndex];
+      const e2 = a.element;
+      if (e2 && !isNaN(e2.x) && !isNaN(e2.y)) {
+        const p = this._elemTip(e2, meta);
+        sx += p.x; sy += p.y; cnt++;
+      }
+    }
+    if (!cnt) { this.hideTip(); return; }
+    const pos = { x: sx / cnt, y: sy / cnt };
+    const m = ttSize(this, o, title, rows);
+    const size = { x: pos.x, y: pos.y, width: m.width, height: m.height };
+    const yAlign = o.yAlign || (size.y < m.height / 2 ? 'top' : (size.y > this.height - m.height / 2 ? 'bottom' : 'center'));
+    const xAlign = o.xAlign || ttAlign(size.x, m.width, o, this.width, yAlign, size);
+    const pt = ttBgPoint(o, size, { xAlign: xAlign, yAlign: yAlign }, this);
+    // DOM build (engine's .svgtip pattern)
+    const tip = this.ttEl;
+    const padding = toPadding(o.padding);
+    const bodyFont = m.bodyFont, titleFont = m.titleFont;
+    tip.style.background = o.backgroundColor;
+    tip.style.border = o.borderWidth + 'px solid ' + o.borderColor;
+    tip.style.borderRadius = o.cornerRadius + 'px';
+    tip.style.padding = padding.top + 'px ' + padding.right + 'px ' + padding.bottom + 'px ' + padding.left + 'px';
+    tip.style.fontFamily = bodyFont.family;
+    tip.style.fontSize = bodyFont.size + 'px';
+    tip.style.lineHeight = 'normal';
+    tip.style.position = 'absolute';
+    tip.style.pointerEvents = 'none';
+    tip.style.zIndex = '10';
+    tip.style.boxSizing = 'border-box';
+    tip.style.width = Math.ceil(m.width) + 'px';
+    tip.style.height = 'auto';
+    let html = '';
+    if (title.length) {
+      html += '<div style="font-weight:' + (titleFont.weight || 'bold') + ';font-size:' + titleFont.size + 'px;line-height:' + titleFont.lineHeight + 'px;color:' + o.titleColor + ';margin-bottom:' + (o.titleMarginBottom) + 'px;white-space:nowrap">' + esc(title.join(' ')) + '</div>';
+    }
+    const blh = o.displayColors ? Math.max(m.boxHeight, bodyFont.lineHeight) : bodyFont.lineHeight;
+    rows.forEach((r, i) => {
+      const yOff = m.boxHeight < bodyFont.lineHeight ? (bodyFont.lineHeight - m.boxHeight) / 2 : 0;
+      const rad = Math.min(m.boxWidth, m.boxHeight) / 2;
+      html += '<div style="position:relative;height:' + blh + 'px;' + (i ? 'margin-top:' + o.bodySpacing + 'px;' : '') + 'white-space:nowrap">' +
+        (o.displayColors ? '<span style="position:absolute;left:0;top:' + yOff + 'px;width:' + m.boxWidth + 'px;height:' + m.boxHeight + 'px;border-radius:50%;box-sizing:border-box;background:' + r.bg + ';border:1px solid ' + r.border + '"></span>' : '') +
+        '<span style="position:absolute;left:' + (m.boxWidth + 2 + o.boxPadding) + 'px;top:0;line-height:' + blh + 'px;color:' + (o.bodyColor) + '">' + esc(r.text) + '</span></div>';
+    });
+    if (tip.innerHTML !== html) tip.innerHTML = html;
+    tip.style.left = '0px';
+    tip.style.top = '0px';
+    tip.style.display = 'block';
+    tip.style.transform = 'translate3d(' + Math.round(pt.x) + 'px,' + Math.round(pt.y) + 'px,0)';
+    this.ttShown = true;
+  };
+  function esc(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+  HChart.prototype.hideTip = function () { this.ttEl.style.display = 'none'; this.ttShown = false; };
+
+  /* ---- events + lifecycle ---- */
+  HChart.prototype.bindEvents = function () {
+    const self = this;
+    this._ro = new ResizeObserver(function () {
+      const w = Math.floor(self.box.clientWidth), h = Math.floor(self.box.clientHeight);
+      if (w !== self.lastW || h !== self.lastH) { self.lastW = w; self.lastH = h; self.render(); }
+    });
+    this._ro.observe(this.box);
+    this.box.addEventListener('mousemove', function (e) {
+      const rect = self.box.getBoundingClientRect();
+      const pos = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+      if (!self.isPointInArea(pos)) return; // chart.js keeps stale state outside area
+      const active = self.getElementsAtEventForMode(pos, 'index', { axis: 'x', intersect: false });
+      self._active = active;
+      self._updateHover(active);
+      self.showTip(active, pos.x, pos.y);
+      const onHover = self.cfg.options && self.cfg.options.onHover;
+      if (onHover) onHover({ type: 'mousemove', x: pos.x, y: pos.y, native: { target: self.svg } }, active, self);
+    });
+    this.box.addEventListener('mouseleave', function () {
+      self._active = [];
+      self._updateHover([]);
+      self.hideTip();
+    });
+    this.box.addEventListener('click', function (e) {
+      const onClick = self.cfg.options && self.cfg.options.onClick;
+      if (!onClick) return;
+      const rect = self.box.getBoundingClientRect();
+      const pos = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+      if (!self.isPointInArea(pos)) return;
+      const active = self.getElementsAtEventForMode(pos, 'index', { axis: 'x', intersect: false });
+      onClick({ type: 'click', x: pos.x, y: pos.y, native: { target: self.svg, clientX: e.clientX, clientY: e.clientY } }, active, self);
+    });
+  };
+  HChart.prototype.destroy = function () {
+    if (this._ro) this._ro.disconnect();
+    if (this.box && this.box.parentNode) this.box.parentNode.removeChild(this.box);
+    const reg = HSVG && HSVG._reg;
+    if (reg) reg.delete(this.host);
+  };
+
+  /* ---- config normalization (Chart.js defaults + chart-type overrides) ---- */
+  function merge1(def, over) {
+    const out = {};
+    for (const k in def) out[k] = def[k];
+    if (over) for (const k2 in over) out[k2] = over[k2];
+    return out;
+  }
+  const GRID_DEF = { display: true, color: 'rgba(0,0,0,0.1)', lineWidth: 1, drawOnChartArea: true, drawTicks: true, tickLength: 8, tickWidth: 1, tickColor: 'rgba(0,0,0,0.1)', offset: false, z: -1 };
+  const BORDER_DEF = { display: true, color: 'rgba(0,0,0,0.1)', width: 1, z: 0 };
+  const TICK_DEF = { display: true, color: '#666', minRotation: 0, maxRotation: 50, mirror: false, textStrokeWidth: 0, textStrokeColor: '', padding: 3, autoSkip: true, autoSkipPadding: 3, labelOffset: 0, align: 'center', crossAlign: 'near', showLabelBackdrop: false, minor: {}, major: {} };
+  const TITLE_DEF = { display: false, text: '', padding: { top: 4, bottom: 4 }, color: undefined, font: undefined, align: 'center' };
+  function normalize(cfg) {
+    const o = cfg.options || {};
+    const type = cfg.type;
+    const out = {
+      type: type,
+      labels: cfg.data.labels,
+      datasets: [],
+      options: o,
+      layoutPadding: (o.layout && o.layout.padding) || 0,
+      ttOpts: merge1(ttDefaults(), (o.plugins && o.plugins.tooltip) || {}),
+      chartBox: false,
+      chartBoxColor: '#ededed',
+      scaleDefs: []
+    };
+    if (o.plugins && isArray(o.plugins)) {} // (unused; plugins passed at top level)
+    if (cfg.plugins && isArray(cfg.plugins)) {
+      for (const p of cfg.plugins) if (p && p.id === 'chartBox') out.chartBox = true;
+    }
+    const scalesIn = o.scales || {};
+    for (const id of Object.keys(scalesIn)) {
+      const so = scalesIn[id];
+      const axis = id[0];
+      const sType = axis === 'x' ? 'category' : 'linear';
+      let offset = so.offset !== undefined ? !!so.offset : false;
+      const grid = merge1(GRID_DEF, so.grid);
+      if (type === 'bar' && axis === 'x') {
+        offset = so.offset !== undefined ? !!so.offset : true;
+        grid.offset = (so.grid && so.grid.offset !== undefined) ? so.grid.offset : true;
+      }
+      const beginAtZero = so.beginAtZero !== undefined ? !!so.beginAtZero : (type === 'bar' && axis !== 'x');
+      const ticks = merge1(TICK_DEF, so.ticks);
+      if (so.ticks && so.ticks.maxTicksLimit !== undefined) ticks.maxTicksLimit = so.ticks.maxTicksLimit; else delete ticks.maxTicksLimit;
+      out.scaleDefs.push({
+        id: id, type: sType, axis: axis,
+        position: so.position || (axis === 'x' ? 'bottom' : 'left'),
+        display: so.display !== undefined ? so.display : true,
+        offset: offset, reverse: !!so.reverse, beginAtZero: beginAtZero,
+        stacked: so.stacked, bounds: 'ticks', grace: 0,
+        grid: grid,
+        border: merge1(BORDER_DEF, so.border),
+        ticks: ticks,
+        title: merge1(TITLE_DEF, so.title),
+        maxTicksLimit: so.maxTicksLimit
+      });
+    }
+    for (const ds of cfg.data.datasets) {
+      out.datasets.push({
+        type: ds.type || type,
+        label: ds.label || '',
+        data: ds.data || [],
+        yAxisID: ds.yAxisID || 'y',
+        stack: ds.stack,
+        backgroundColor: ds.backgroundColor || 'rgba(0,0,0,0.1)',
+        borderColor: ds.borderColor || 'rgba(0,0,0,0.1)',
+        borderWidth: ds.borderWidth === undefined ? 0 : ds.borderWidth,
+        pointRadius: ds.pointRadius === undefined ? (ds.type === 'line' || (!ds.type && type === 'line') ? 3 : 0) : ds.pointRadius,
+        pointHoverRadius: ds.pointHoverRadius,
+        pointBackgroundColor: ds.pointBackgroundColor,
+        pointBorderColor: ds.pointBorderColor,
+        tension: ds.tension === undefined ? (ds.type === 'line' || (!ds.type && type === 'line') ? 0 : 0) : ds.tension,
+        spanGaps: !!ds.spanGaps,
+        hoverBackgroundColor: ds.hoverBackgroundColor
+      });
+    }
+    if (cfg.chartBoxColor) out.chartBoxColor = cfg.chartBoxColor;
+    return out;
+  }
+
+  const HSVG = {
+    _reg: (typeof WeakMap !== 'undefined') ? new WeakMap() : new Map(),
+    create: function (host, cfg, chartBoxColor) {
+      const norm = normalize(cfg);
+      if (chartBoxColor) norm.chartBoxColor = chartBoxColor;
+      norm.host = host;
+      const ch = new HChart(host, norm);
+      this._reg.set(host, ch);
+      host.__blowHitTest = function (e) {
+        const rect = ch.box.getBoundingClientRect();
+        const pos = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+        const hits = ch.getElementsAtEventForMode(pos, 'nearest', { intersect: true });
+        return hits.length ? { di: hits[0].datasetIndex, i: hits[0].index } : null;
+      };
+      return ch;
+    },
+    getChart: function (host) { return this._reg.get(host) || null; },
+    measureText: function (text, fontString) { const c = getMeasCtx(); c.font = fontString; return c.measureText(text).width; }
+  };
+  return HSVG;
+})();
+
+
+
+
+
+
+
+
+
+const tooltipCfg = () => ({
+  animation: false, animations: false, xAlign: 'center', yAlign: 'bottom', caretSize: 0, caretPadding: 8,
+  backgroundColor: '#fff', titleColor: '#1a1a1a', bodyColor: '#3d3d3d', borderColor: '#e4e4e4',
+  borderWidth: 1, padding: 10, cornerRadius: 6, displayColors: true, usePointStyle: true,
+  filter: it => it.parsed.y !== null && it.parsed.y !== undefined,
+  titleFont: { size: THEME.labelSize, weight: '600', family: 'Inter' },
+  bodyFont: { size: THEME.labelSize, family: 'Inter' }
+});
+const baseOptions = () => ({
+  responsive: true, maintainAspectRatio: false, animation: false,
+  devicePixelRatio: Math.max(2, window.devicePixelRatio || 1),
+  layout: { padding: { top: 4, right: 2, bottom: 0, left: 0 } },
+  interaction: { mode: 'index', intersect: false },
+  plugins: { legend: { display: false },
+             tooltip: Object.assign(tooltipCfg(), { enabled: !(window.innerWidth <= 560 || (navigator.maxTouchPoints || 0) > 0) }) },
+  scales: {}
+});
+const gridY = () => ({ color: THEME.grid, drawTicks: false });
+function drawLegend(el, items, onToggle) {
+  el.innerHTML = items.map((it, i) =>
+    '<span class="item' + (onToggle ? ' tog' : '') + (it.off ? ' off' : '') + '" data-i="' + i + '">' +
+      '<span class="sw" style="background:' + it.color + '"></span>' + it.label +
+      (onToggle ? '<span class="x">\\u00d7</span>' : '') + '</span>').join('');
+  if (!onToggle) return;
+  el.querySelectorAll('.item').forEach(node => {
+    node.addEventListener('click', () => onToggle(items[Number(node.dataset.i)].label));
+  });
+}
+const chartBox = { id: 'chartBox' };
+
+const label = k => LABELS[k] || k.replace(/([a-z])([A-Z])/g, '$1 $2');
+const fmtDay = d => { const [y,m,dd] = d.split('-'); return new Date(y, m-1, dd).toLocaleDateString(undefined, { month:'short', day:'numeric' }); };
+const RANGES = [['7d',7],['30d',30],['90d',90],['1y',365],['all',null]];
+const MODES = ['raw','smoothed','average'];
+let RANGE = '90d', MODE = 'raw';
+const VIS = {}, charts = [];
+
+const daysIn = () => { const n = RANGES.find(r => r[0] === RANGE)[1];
+  return n === null ? DATA.days : DATA.days.slice(Math.max(0, DATA.days.length - n)); };
+// A day or two of history draws a line with nothing to connect, so the card
+// looks empty even though the data is there. Show the points themselves until
+// there is enough history for the line to carry the shape on its own.
+function dotR(vals) {
+  let n = 0;
+  for (const v of vals) if (v !== null && v !== undefined) n++;
+  return n <= 2 ? 3 : 0;
+}
+function shape(vals) {
+  if (MODE === 'raw') return vals;
+  if (MODE === 'average') {
+    const nums = vals.filter(v => v !== null && v !== undefined);
+    const m = nums.length ? nums.reduce((a,b) => a+b, 0) / nums.length : null;
+    return vals.map(v => v === null || v === undefined ? null : m);
+  }
+  const out = [];
+  for (let i = 0; i < vals.length; i++) {
+    let s = 0, c = 0;
+    for (let j = Math.max(0, i-6); j <= i; j++) if (vals[j] !== null && vals[j] !== undefined) { s += vals[j]; c++; }
+    out.push(c ? s/c : null);
+  }
+  return out;
+}
+function valsFor(key, days) {
+  const s = DATA.series[key]; if (!s) return null;
+  const m = new Map(s.points);
+  return days.map(d => m.has(d) ? m.get(d) : null);
+}
+
+function buildLine(el, card, keys, days) {
+  const shown = keys.filter(k => VIS[card.id].has(k));
+  let wrap = el.querySelector('.wrap');
+  if (!wrap) { wrap = document.createElement('div'); wrap.className = 'wrap'; el.appendChild(wrap); }
+  wrap.innerHTML = '';
+  if (!shown.length) { wrap.innerHTML = '<div class="empty">every series here is switched off</div>'; return; }
+  wrap.style.position = 'relative';
+  const cv = document.createElement('div'); cv.className = 'svghost'; cv.style.height = '100%'; wrap.appendChild(cv);
+  const units = [];
+  shown.forEach(k => { const u = DATA.series[k].unit; if (!units.includes(u)) units.push(u); });
+  const axisOf = {};
+  units.forEach((u, i) => axisOf[u] = i === 0 ? 'y' : (i < 3 ? 'y' + i : 'y'));
+  const opts = baseOptions();
+  opts.plugins.tooltip.callbacks = { title: it => fmtDay(days[it[0].dataIndex]) };
+  opts.scales.x = { grid: { display: false }, border: { color: THEME.axis },
+    ticks: Object.assign(tickCfg(), { maxTicksLimit: 7, maxRotation: 0, callback: (v, i) => fmtDay(days[i]) }) };
+  Object.entries(axisOf).forEach(([u, id]) => {
+    if (opts.scales[id]) return;
+    opts.scales[id] = { position: id === 'y' ? 'left' : 'right',
+      grid: id === 'y' ? gridY() : { display: false }, border: { display: false },
+      title: { display: true, text: u, color: THEME.tick, font: { size: 10, family: THEME.font } },
+      ticks: Object.assign(tickCfg(), { maxTicksLimit: 6 }) };
+  });
+  const ds = shown.map(k => {
+    const color = THEME.pastel[keys.indexOf(k) % THEME.pastel.length];
+    const vals = shape(valsFor(k, days));
+    return { label: label(k), data: vals, borderColor: color, backgroundColor: color,
+             yAxisID: axisOf[DATA.series[k].unit], borderWidth: 2, pointRadius: dotR(vals), pointHoverRadius: 3,
+             tension: 0.25, spanGaps: true };
+  });
+  // A single point sits on the axis line and gets sliced in half by the plot
+  // edge. Offsetting the category scale centres it in its own slot instead.
+  if (ds.some(d => d.pointRadius > 0)) opts.scales.x.offset = true;
+  const hchart = HSVG.create(cv, { type: 'line', data: { labels: days, datasets: ds }, options: opts, plugins: [chartBox] });
+  cv.__svgChart = hchart;
+  charts.push(hchart);
+}
+
+/* ---- Sleep-bar blow-up: click a day's stacked sleep bar to fan it out into
+   its stage segments on a side panel while the chart pans away. ---- */
+const isDesktop = () => matchMedia('(hover: hover) and (pointer: fine)').matches;
+let blowState = null;
+function closeBlow(root) {
+  root = root || document;
+  root.querySelectorAll('.blow').forEach(b => b.remove());
+  document.body.classList.remove('blowing');
+  if (blowState) {
+    const st = blowState; blowState = null;
+    if (st.focus) {
+      const ds = st.focus.chart.data.datasets[st.focus.di];
+      ds.backgroundColor = st.focus.color;
+      ds.hoverBackgroundColor = st.focus.hover;
+      st.focus.chart.update();
+    }
+    st.wrap.style.width = '';
+    st.wrap.style.marginLeft = '';
+    requestAnimationFrame(() => { const eng = st.cv && st.cv.__svgChart; if (eng) eng.resize(); });
+  }
+}
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeBlow(); });
+// Clicking another bar while a blow-up is open retargets the panel to that
+// bar; clicking anything that is not a bar closes it. Either way the chart's
+// own RAF-delayed onClick is swallowed (suppressBlowClick) so a stale
+// coordinate lookup cannot fire after the panel's layout shift.
+var suppressBlowClick = false;
+// Any non-panel click closes the blow-up. Listening on click rather than
+// pointerdown means the layout only shifts after hit-testing, so a click can
+// never be mapped against a half-resized chart (that race used to open the
+// wrong bar).
+document.addEventListener('click', e => {
+  const panel = document.querySelector('.blow');
+  if (!panel || panel.contains(e.target)) return;
+  /* Owner 8/17 ("go back to whatever was under the popup"): clicks on the record
+     sheet or its dim dismiss the SHEET only - never the blow-up underneath.
+     This runs in the capture phase, so the backdrop's own stopPropagation
+     arrives too late; its clicks must be exempted here at the source. */
+  if (e.target.closest && e.target.closest('.rsheet-back')) return;
+  const svghost = e.target.closest && e.target.closest('.svghost');
+  if (svghost) {
+    // The blow retarget must hit-test on pre-shift geometry, before the panel
+    // layout moves anything (that race used to open the wrong bar).
+    suppressBlowClick = true;
+    // Consumed by whatever chart onClick the click reaches; the timeout is
+    // only a fallback for clicks that never reach a chart handler.
+    setTimeout(() => { suppressBlowClick = false; }, 1500);
+    const hit = svghost.__blowHitTest ? svghost.__blowHitTest(e) : null;
+    if (hit && svghost.__blowRetarget) {
+      closeBlow();
+      requestAnimationFrame(() => { svghost.__blowRetarget(hit.di, hit.i); });
+      return;
+    }
+  }
+  closeBlow();
+}, true);
+const fmtVal = (v, u) => Math.round(v) + ' ' + u;
+/* Shared side-dock width + squash (Owner 8/15: "the squishing mechanism is
+   the same as the macros one... a shared item"). Every right-docked panel -
+   macros blow-up and workout table alike - is 316px wide and squeezes the
+   chart wrap through this one pass. */
+const BLOW_PANEL_W = 316;
+function squishWrapForPanel(wrap, panelW, resizer) {
+  const fullW = wrap.clientWidth;
+  wrap.style.width = (fullW - panelW) + 'px';
+  /* Resize synchronously so the squash, the panel append and the chart's
+     redraw commit in ONE paint - a deferred resize leaves one frame where
+     the old wide canvas and the new panel co-exist (visible swap glitch). */
+  if (resizer) resizer();
+  return fullW;
+}
+const notionUrl = window.__notionUrl || (window.__notionUrl = u => (u || '').split('https://app.notion.com/').join('https://www.notion.so/').split('https://www.notion.com/').join('https://www.notion.so/').split('https://notion.so/').join('https://www.notion.so/'));
+/* Owner 8/16 11pm: mobile taps still glitch. Root cause: inside Notion's own
+   iOS-embed webview, https taps to notion.so stays trapped (universal-link
+   upgrade never fires there); and even in Safari a plain anchor relies on
+   the universal-link path. Course: on coarse-pointer devices route every
+   Notion link through openNotion(), which tries the notion:// scheme first
+   (the app claims it - works inside the embed AND from Safari), and falls
+   back to the same-tab web URL only if nothing takes it. Desktop keeps the
+   exact same-tab anchor behavior they confirmed "works perfectly". */
+const openNotion = window.__openNotion || (window.__openNotion = function (webUrl) {
+  webUrl = notionUrl(webUrl);
+  /* Screen recording 8/16 11:26 PM: inside the Notion iOS app the chart is
+     an embedded iframe; window.location/scheme navigation only moves the
+     IFRAME, which goes blank forever (Notion refuses iframing / the app
+     never routes it). The escape hatch: hand the navigation to the TOP
+     frame - Notion's app owns that webview and its router opens the page
+     natively in-app ("navigate to the page within the app"). Cross-origin
+     iframes may WRITE top.location even though they cannot read it. */
+  let inFrame = false;
+  try { inFrame = window.self !== window.top; } catch (e) { inFrame = true; }
+  /* v5 (8/16 11:41 PM retest): notion://www.notion.so/<bare-id> gets routed
+     natively now but hangs in perpetual loading - the app's router can't
+     resolve that marketing-host + bare-id form. The canonical app URL per
+     the Notion API is https://app.notion.com/p/<slug>-<id>, so the scheme
+     the native router actually ingests lives on app.notion.com/p/. */
+  const scheme = 'notion://app.notion.com/p/' + webUrl.split('/').pop();
+  if (inFrame) {
+    /* Retest 8/16 11:37 PM: navigating the top frame to the https URL only
+       opened Notion's IN-APP BROWSER (notion.so -> app.notion.com -> login
+       wall). Owner: "it needs to all be in the app... like a button in
+       notion". So in-frame taps fire the notion:// scheme AT THE TOP FRAME
+       first - WKWebView in the Notion app hands custom schemes to the OS,
+       the OS claims it for Notion, and Notion routes to the page natively.
+       Web fallback (top frame) covers the no-app case. */
+    let tid = setTimeout(function () {
+      /* Absolute https only. Cross-origin top-nav resolves relative URLs
+         against the CHILD origin (workers.dev), so a relative fallback
+         would 404 the whole app webview - never do that here. */
+      if (!document.hidden) { try { window.top.location.href = webUrl; } catch (e1) {} }
+    }, 2500);
+    document.addEventListener('visibilitychange', function onV() {
+      if (document.hidden) { clearTimeout(tid); document.removeEventListener('visibilitychange', onV); }
+    });
+    window.addEventListener('pagehide', function () { clearTimeout(tid); }, { once: true });
+    /* No window.open here: a sheet that loads notion:// inside the app's
+       in-app browser is exactly the dead "opens as a link" screen Owner hates.
+       Single authoritative write to the top frame with the tap's user
+       activation; the https fallback above covers app-not-installed. */
+    try { window.top.location.href = scheme; } catch (e2) { try { window.top.location.replace(scheme); } catch (e3) {} }
+    return;
+  }
+  const coarse = window.matchMedia && window.matchMedia('(pointer: coarse)').matches;
+  if (!coarse) {
+    /* Desktop. The universal-link host (www.notion.so) costs a soft-redirect
+       hop (session_sync before the SPA boots); skip it and aim straight at
+       the canonical app URL. If the Notion DESKTOP app is installed it claims
+       the notion:// scheme and opens the page natively instead - blur (the OS
+       stole focus for the app/dialog) cancels the https fallback; nothing
+       claimed -> same-tab https to the canonical form. */
+    const canon = 'https://app.notion.com/p/' + webUrl.split('/').pop();
+    /* One-time cost: cache the probe outcome so repeat clicks skip the 700ms
+       dead time the first click paid to learn it. */
+    let probeKnown = '';
+    try { probeKnown = localStorage.getItem('notionScheme') || ''; } catch (eProbe) {}
+    if (probeKnown === 'web') { window.location.assign(canon); return; }
+    const tid = setTimeout(function () {
+      try { localStorage.setItem('notionScheme', 'web'); } catch (eSet1) {}
+      window.location.assign(canon);
+    }, 700);
+    /* Browser "open this app?" dialogs blur the page too; if focus comes back
+       (dialog dismissed, nothing claimed) the https fallback must still run. */
+    const onBlur = function () {
+      clearTimeout(tid);
+      window.removeEventListener('blur', onBlur);
+      try { localStorage.setItem('notionScheme', 'app'); } catch (eSet2) {}
+      const blurredAt = Date.now();
+      const onFocus = function () {
+        window.removeEventListener('focus', onFocus);
+        /* Focus back within ~30s = the OS dialog was dismissed without claiming
+           the scheme - run the https fallback. Much later = the app actually
+           opened and the user is returning; do not yank the tab to the web. */
+        if (Date.now() - blurredAt < 30000 && !document.hidden) {
+          try { localStorage.setItem('notionScheme', 'web'); } catch (eSet3) {}
+          window.location.assign(canon);
+        }
+      };
+      window.addEventListener('focus', onFocus);
+    };
+    window.addEventListener('blur', onBlur);
+    window.addEventListener('pagehide', function () { clearTimeout(tid); window.removeEventListener('blur', onBlur); }, { once: true });
+    try { window.location.href = scheme; } catch (e) { clearTimeout(tid); window.location.assign(canon); }
+    return;
+  }
+  /* Standalone mobile Safari/Chrome: scheme first so the app opens it
+     directly; 2.5s later, if the page is still visible (scheme went
+     nowhere), same-tab web fallback. */
+  let tid = setTimeout(function () {
+    if (!document.hidden) window.location.assign(webUrl);
+  }, 2500);
+  document.addEventListener('visibilitychange', function onV() {
+    if (document.hidden) { clearTimeout(tid); document.removeEventListener('visibilitychange', onV); }
+  });
+  window.addEventListener('pagehide', function () { clearTimeout(tid); }, { once: true });
+  window.location.assign(scheme);
+});
+const isCoarsePtr = window.__isCoarsePtr || (window.__isCoarsePtr = function () {
+  return (window.matchMedia && window.matchMedia('(pointer: coarse)').matches) || 'ontouchstart' in window;
+});
+const isInFrame = window.__isInFrame || (window.__isInFrame = function () {
+  let f = false; try { f = window.self !== window.top; } catch (e) { f = true; } return f;
+});
+/* Owner 8/17: a tap on a food row must not start a Notion SPA boot. Render the
+   record in-app from data already embedded in this page - same frame, zero
+   network. Steering ("Kill the open in notion and kill the paragraph"): the
+   sheet is JUST the name, the kcal, and the macro rows - no Notion link, no
+   provenance text. The day header link still navigates to Notion as before. */
+const closeRecordSheet = window.__closeRecordSheet || (window.__closeRecordSheet = function () {
+  const b = document.querySelector('.rsheet-back');
+  if (!b || b.classList.contains('hiding')) return;
+  /* Matches the goals panel close: .hiding shortens the fade to 0.15s. */
+  b.classList.add('hiding');
+  b.classList.remove('show');
+  setTimeout(function () { b.remove(); }, 160);
+});
+const openRecordSheet = window.__openRecordSheet || (window.__openRecordSheet = function (seg) {
+  const rec = seg.rec || [];
+  closeRecordSheet();
+  const esc = s => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const nf = v => { v = Number(v) || 0; return (Math.abs(v % 1) > 0.001 ? Math.round(v * 10) / 10 : Math.round(v)) + ''; };
+  /* Owner 8/17: "if the amount is 0g don't show it in the view" - zero rows out. */
+  const macroRow = (label, v, unit) => (Number(v) || 0) <= 0 ? '' : '<div class="rsheet-row"><span class="rsheet-k">' + label + '</span><span>' + nf(v) + ' ' + unit + '</span></div>';
+  const back = document.createElement('div');
+  back.className = 'rsheet-back';
+  back.innerHTML =
+    '<div class="rsheet" role="dialog">' +
+      '<div class="rsheet-head">' + esc(seg.name) + '</div>' +
+      '<div class="rsheet-big">' + nf(rec[1]) + '<span> kcal</span></div>' +
+      /* Owner 8/17 hierarchy: calories (the big number), then protein, sodium,
+         carbs, fat, sat fat, sugar, fiber. Retraction: no Calories row - the
+         big number covers it ("oh calories is in the main things, sry lol"). */
+      macroRow('Protein', rec[2], 'g') + macroRow('Sodium', rec[8], 'mg') +
+      macroRow('Carbs', rec[3], 'g') + macroRow('Fat', rec[4], 'g') + macroRow('Sat fat', rec[5], 'g') +
+      macroRow('Sugar', rec[6], 'g') + macroRow('Fiber', rec[7], 'g') +
+    '</div>';
+  /* Tap-outside must dismiss ONLY the sheet - swallow the event so the
+     blow-up under it stays open (Owner 8/17: "go back to whatever was under the
+     popup", not to the base chart). */
+  back.addEventListener('click', function (e) {
+    e.stopPropagation();
+    if (e.target === back) closeRecordSheet();
+  });
+  back.addEventListener('pointerdown', function (e) { e.stopPropagation(); });
+  document.body.appendChild(back);
+  /* Fade in like the goals panel: double-rAF so the transition actually runs. */
+  requestAnimationFrame(function () { requestAnimationFrame(function () { back.classList.add('show'); }); });
+});
+document.addEventListener('keydown', function (e) { if (e.key === 'Escape') closeRecordSheet(); });
+document.addEventListener('click', function (e) {
+  const t = e.target, a = t && t.closest ? t.closest('a[data-nnotion]') : null;
+  if (!a) return;
+  if (e.metaKey || e.ctrlKey) return; // open-in-new-tab: plain anchor
+  /* Food item rows carry a full inline record: open the instant in-app sheet
+     instead of paying Notion's load. Anything without one navigates as before. */
+  if (a.dataset && a.dataset.nseg != null) {
+    const panel = a.closest('.blow');
+    const seg = panel && panel.__segs && panel.__segs[Number(a.dataset.nseg)];
+    if (seg && seg.rec) { e.preventDefault(); openRecordSheet(seg); return; }
+  }
+  if (isInFrame()) { e.preventDefault(); openNotion(a.getAttribute('href')); return; }
+  e.preventDefault();
+  openNotion(a.getAttribute('href'));
+});
+/* Warm the Notion handoff before it's needed: first hover on a Notion link
+   prefetches the canonical record document. Desktop only; once per URL. */
+const __notionPrefetched = {};
+document.addEventListener('mouseover', function (e) {
+  const a = e.target && e.target.closest ? e.target.closest('a[data-nnotion]') : null;
+  if (!a) return;
+  if (window.matchMedia && window.matchMedia('(pointer: coarse)').matches) return;
+  const href = 'https://app.notion.com/p/' + String(a.getAttribute('href') || '').split('/').pop();
+  if (__notionPrefetched[href]) return;
+  __notionPrefetched[href] = 1;
+  const l = document.createElement('link');
+  l.rel = 'prefetch'; l.href = href;
+  document.head.appendChild(l);
+});
+function blowPanel(cv, title, segs, unit, total, onLeft, focus, dayUrl) {
+  closeBlow();
+  const wrap = cv.closest('.wrap');
+  const card = cv.closest('.card, .hcard');
+  if (!wrap || !card) return;
+  const PANEL_W = BLOW_PANEL_W;
+  const fullW = wrap.clientWidth, baseL = wrap.offsetLeft, baseT = wrap.offsetTop, baseH = wrap.offsetHeight;
+  /* A phone in desktop-Safari mode (or a pinch-zoomed/narrow embed) keeps a
+     wide innerWidth, so width alone misses touch devices. Any touch device
+     docks the blow-up below the chart instead of panning the chart aside. */
+  const narrow = window.innerWidth <= 560 || (navigator.maxTouchPoints || 0) > 0 ||
+    (window.__BLOW_DEBUG && window.__BLOW_DEBUG.forceNarrow);
+  /* A wide window whose wrap can't spare PANEL_W beside the chart used to
+     abandon the blow-up outright (a 316-456px embed just did nothing on a
+     bar click); dock it below the chart, same as the touch path. linksOn
+     below stays keyed on narrow itself - the link-hostile client is a touch
+     webview, not a skinny desktop embed, so links keep working there. */
+  const dockNarrow = narrow || fullW <= PANEL_W + 140;
+  closeBlow();
+  if (!dockNarrow) {
+    if (onLeft) wrap.style.marginLeft = PANEL_W + 'px';
+    squishWrapForPanel(wrap, PANEL_W, () => {
+      const engSquash = cv.__svgChart;
+      if (engSquash) engSquash.resize();
+      else if (typeof Chart !== 'undefined') { const chSquash = Chart.getChart ? Chart.getChart(cv) : null; if (chSquash) chSquash.resize(); }
+    });
+  }
+  const panel = document.createElement('div');
+  panel.className = 'blow ' + (onLeft ? 'left' : 'right');
+  /* Links for everyone (Owner 8/16: "I click on the stuff in the popup and it
+     doesn't work"): anchors are same-tab everywhere (8/16 pm), and on
+     coarse-pointer devices a delegated click handler routes them through
+     openNotion() - notion:// scheme first, same-tab web fallback - so taps
+     work inside the Notion app embed webview too, not just Safari. */
+  const linksOn = true;
+  const headTxt = linksOn && dayUrl ? '<a data-nnotion="1" href="' + notionUrl(dayUrl) + '">' + title + '</a>' : title;
+  let inner = '<div class="blow-head"><span>' + headTxt + '</span></div>';
+  if (segs.length) {
+    const tot = total != null ? total : segs.reduce((a, s) => a + s.v, 0);
+    const bar = segs.map(s => '<div style="flex:' + s.v + ';background:' + s.color + '" title="' + s.name + '"></div>').join('');
+    const list = segs.map((s, si) =>
+      (linksOn && s.url ? '<a class="blow-item" data-nseg="' + si + '" data-nnotion="1" href="' + notionUrl(s.url) + '">' : '<span class="blow-item">') +
+      '<span class="dot" style="background:' + s.color + '"></span><span class="n">' + s.name + '</span><span class="v">' + fmtVal(s.v, unit) + '</span></' + (linksOn && s.url ? 'a' : 'span') + '>').join('');
+    inner += '<div class="blow-body"><div class="blow-bar">' + bar + '</div><div class="blow-list">' + list +
+      (tot != null ? '<div class="blow-total"><span>Total</span><span>' + fmtVal(tot, unit) + '</span></div>' : '') + '</div></div>';
+  } else {
+    inner += '<div class="blow-empty">Nothing logged yet.</div>';
+  }
+  panel.innerHTML = inner;
+  panel.__segs = segs;
+  card.appendChild(panel);
+  blowState = { wrap, cv, focus: focus || null };
+  if (dockNarrow) document.body.classList.add('blowing');
+  if ((window.innerHeight || document.documentElement.clientHeight || 1e5) <= 420) {
+    // Strip-size embed (Notion): no room below the chart either - the blow-up
+    // overlays the strip with its own scroll and an explicit close control.
+    panel.classList.add('narrow', 'compact');
+    const headSpan = panel.querySelector('.blow-head span');
+    if (headSpan) headSpan.insertAdjacentHTML('afterend', '<button class="bx" onclick="closeBlow()" aria-label="Close" style="margin-left:auto;font:inherit;background:none;border:0;color:#797979;padding:0 4px;cursor:pointer;font-size:15px;">&times;</button>');
+    return;
+  }
+  if (dockNarrow) {
+    // Docked below (touch, narrow viewport, or a wrap too skinny for a side
+    // panel): a plain stacked list under the chart. No absolute positioning,
+    // no dodge/leader pass (alignBlowList stays desktop-only).
+    panel.classList.add('narrow');
+    return;
+  }
+  panel.style.left = (onLeft ? baseL : baseL + fullW - PANEL_W) + 'px';
+  panel.style.width = PANEL_W + 'px';
+  /* Geometry now, not in a later animation frame: a deferred assignment
+     paints the absolute panel one frame at its un-positioned flow spot over
+     the legend (the one-frame flash on bar swaps). All numbers are already
+     measurable: offsets cause one sync layout, which is fine here. */
+  const eng0 = cv.__svgChart;
+  const head0 = panel.querySelector('.blow-head');
+  const caTop0 = eng0 && eng0.chartArea() ? eng0.chartArea().top : 0;
+  const headH0 = head0 ? head0.offsetHeight : 0;
+  const top0 = Math.max(baseT + 2, baseT + caTop0 - headH0 / 2);
+  panel.style.top = top0 + 'px';
+  panel.style.height = Math.max(140, baseT + baseH - 8 - top0) + 'px';
+  alignBlowList(panel);
+}
+
+// Each item row's vertical middle is placed at its segment's midpoint inside
+// the bar. Thin slices would crowd their rows on top of each other, so a dodge
+// pass enforces a minimum gap and, if rows overflow the bottom, pulls the whole
+// stack back up. Big slices automatically spread their rows out.
+function alignBlowList(panel) {
+  const list = panel.querySelector('.blow-list'), bar = panel.querySelector('.blow-bar');
+  if (!list || !bar) return;
+  const rows = Array.from(list.querySelectorAll('.blow-item'));
+  if (!rows.length) return;
+  const H = bar.clientHeight;
+  if (!H) return;
+  {
+    const segsEls = Array.from(bar.children);
+    const mids = segsEls.map(el => el.offsetTop + el.offsetHeight / 2);
+    let hs = rows.map(n => n.offsetHeight);
+    /* Owner 8/22 (12-row carbs blow-up: the last item lands on the Total row,
+       "in the extreme case shrink the item-dot size, the name font and the
+       value font so everything fits; adaptive, normal case unchanged"): when
+       the rows cannot stack above the Total with the dodge pass, scale the
+       row typography down until they fit - dot size, name/value font, and
+       row padding move together. The factor is length-computed (stack the
+       rows need / space above the Total) and floored at 0.5 so text never
+       collapses. Comfortable lists get k = 1 and nothing moves. */
+    {
+      const totalEl0 = list.querySelector('.blow-total');
+      const limit0 = H - (totalEl0 ? totalEl0.offsetHeight : 0) - 10;
+      const needed = hs.reduce((a, h) => a + h, 0) + 2 * Math.max(rows.length - 1, 0);
+      if (needed > limit0 && needed > 0) {
+        const k = Math.max(0.5, limit0 / needed);
+        rows.forEach(n => {
+          n.style.fontSize = (12 * k) + 'px';
+          n.style.paddingTop = n.style.paddingBottom = (3 * k) + 'px';
+          n.style.gap = (8 * k) + 'px';
+          const dot = n.querySelector('.dot');
+          if (dot) { dot.style.width = (8 * k) + 'px'; dot.style.height = (8 * k) + 'px'; }
+        });
+        // Re-measure with the shrunk rows so the dodge pass sees real heights.
+        hs = rows.map(n => n.offsetHeight);
+      }
+    }
+    // Every row starts exactly at its own slice's vertical center. A row
+    // moves ONLY when it genuinely collides with a neighbour, and the shift
+    // ripples through the colliding chain only - rows with room to spare
+    // keep their exact center (Owner's rule: displacement propagates between
+    // actually-crowding neighbours, never across free space).
+    const pos = mids.map((m, i) => m - hs[i] / 2);
+    const minGap = 2;
+    for (let i = 1; i < pos.length; i++) {
+      if (pos[i] < pos[i - 1] + hs[i - 1] + minGap) pos[i] = pos[i - 1] + hs[i - 1] + minGap;
+    }
+    // A slice with a tiny share near the stack top lands its row's midpoint
+    // ABOVE the list top. Lift only the top chain of touching rows, as a
+    // unit; loose rows below are untouched.
+    if (pos[0] < 0) {
+      let j = 0;
+      while (j + 1 < pos.length && pos[j + 1] <= pos[j] + hs[j] + minGap + 0.5) j++;
+      const lift = -pos[0];
+      for (let k = 0; k <= j; k++) pos[k] += lift;
+    }
+    // Bottom overflow: lift ONLY the bottom chain of touching rows into the
+    // slack beneath the loose row above it. If the slack cannot absorb the
+    // overflow, fall back to the uniform pull (everything is jammed anyway).
+    const totalEl = list.querySelector('.blow-total');
+    const limit = H - (totalEl ? totalEl.offsetHeight : 0) - 10;
+    if (pos.length && pos[pos.length - 1] + hs[hs.length - 1] > limit) {
+      const over = pos[pos.length - 1] + hs[hs.length - 1] - limit;
+      let j = pos.length - 1;
+      while (j > 0 && pos[j] <= pos[j - 1] + hs[j - 1] + minGap + 0.5) j--;
+      const slack = j > 0 ? pos[j] - (pos[j - 1] + hs[j - 1] + minGap) : -1;
+      if (slack >= over && j > 0) {
+        for (let k = j; k < pos.length; k++) pos[k] -= over;
+      } else {
+        pos[pos.length - 1] = limit - hs[hs.length - 1];
+        for (let i = pos.length - 2; i >= 0; i--) pos[i] = Math.min(pos[i], pos[i + 1] - hs[i] - minGap);
+        if (pos[0] < 0) { const lift = -pos[0]; for (let i = 0; i < pos.length; i++) pos[i] += lift; }
+      }
+    }
+    rows.forEach((n, i) => {
+      n.style.position = 'absolute'; n.style.left = '4px'; n.style.right = '4px';
+      n.style.top = Math.round(pos[i]) + 'px';
+    });
+
+    // Leader lines for EVERY row (Owner's rule): the line from the slice edge
+    // to its row is straight when the row sits at its slice's center, and
+    // bends diagonally when the row was dodged away from it.
+    const body = list.parentElement, bodyRect = body.getBoundingClientRect();
+    const barRect = bar.getBoundingClientRect();
+    const listRect = list.getBoundingClientRect();
+    const svgNS = 'http://www.w3.org/2000/svg';
+    let svg = body.querySelector('svg.blow-leaders');
+    if (svg) svg.remove();
+    {
+      svg = document.createElementNS(svgNS, 'svg');
+      svg.setAttribute('class', 'blow-leaders');
+      svg.style.cssText = 'position:absolute;left:0;top:0;overflow:visible;pointer-events:none;z-index:1;';
+      const W = body.clientWidth, Hh = body.clientHeight;
+      svg.setAttribute('width', W); svg.setAttribute('height', Hh);
+      const colors = rows.map(n => { const d = n.querySelector('.dot'); return d ? d.style.background : '#bbb'; });
+      rows.forEach((n, i) => {
+        // The line always starts on the slice at its center, and always ends
+        // AT THE DOT, wherever displacement actually put it - the dodge pass
+        // owns the row's final y, the line just follows it. The stroke keeps
+        // the SAME air off its slice edge and off its dot (Owner 7:19pm: the
+        // gap on the right equals the gap on the left), 3px each side.
+        const dot = n.querySelector('.dot');
+        const dr = dot ? dot.getBoundingClientRect() : null;
+        const segY = barRect.top - bodyRect.top + mids[i];
+        const rowY = listRect.top - bodyRect.top + pos[i] + hs[i] / 2;
+        const dotY = dr ? dr.top - bodyRect.top + dr.height / 2 : rowY;
+        const SIDE_GAP = 3;
+        const x0 = barRect.right - bodyRect.left + SIDE_GAP;
+        let x1 = (dr ? dr.left - bodyRect.left : listRect.left - bodyRect.left + 7) - SIDE_GAP;
+        if (x1 < x0 + 8) x1 = x0 + 8;
+        const ln = document.createElementNS(svgNS, 'polyline');
+        if (Math.abs(dotY - segY) <= 1.5) {
+          // In its proper place: perfectly straight - and drawn AT THE DOT's
+          // center y, not the slice's: segY and dotY can sit a half pixel
+          // apart (odd row heights), and at dpr 2 that half pixel shows as a
+          // full device pixel of misalignment (Owner 7:29pm).
+          ln.setAttribute('points', x0 + ',' + dotY + ' ' + x1 + ',' + dotY);
+        } else {
+          // Dodged away: half the line runs straight out of the slice, the
+          // other half is the diagonal. 50/50, per Owner's Quail eggs call.
+          const xBend = x0 + (x1 - x0) * 0.5;
+          ln.setAttribute('points', x0 + ',' + segY + ' ' + xBend + ',' + segY + ' ' + x1 + ',' + dotY);
+        }
+        ln.setAttribute('fill', 'none');
+        ln.setAttribute('stroke', colors[i]);
+        ln.setAttribute('stroke-width', '1');
+        svg.appendChild(ln);
+      });
+      body.appendChild(svg);
+    }
+  }
+}
+function openSleepBlow(cv, day, onLeft) {
+  const by = new Map(DATA.sleep.map(s => [s.day, s]));
+  const s = by.get(day);
+  if (!s) return;
+  const stages = [['deep', 'Deep', '#7ba6ee'], ['core', 'Core', '#b193de'], ['rem', 'REM', '#ec8c8c'], ['awake', 'Awake', '#c9ced6']];
+  const segs = stages.map(([k, name, color]) => ({ name: name, v: s[k] != null ? s[k] / 60 : 0, color: color }))
+    .filter(e => e.v > 0)
+    .sort((a, b) => a.v - b.v);
+  blowPanel(cv, fmtDay(day) + ' · Sleep', segs, 'hr', null, onLeft);
+}
+
+function buildSleep(el, days) {
+  const by = new Map(DATA.sleep.map(s => [s.day, s]));
+  const wrap = document.createElement('div'); wrap.className = 'wrap'; el.appendChild(wrap);
+  if (!days.some(d => by.has(d))) { wrap.innerHTML = '<div class="empty">no sleep data in this range</div>'; return; }
+  wrap.style.position = 'relative';
+  const cv = document.createElement('div'); cv.className = 'svghost'; cv.style.height = '100%'; wrap.appendChild(cv);
+  const stages = [['deep','Deep','#7ba6ee'],['core','Core','#b193de'],['rem','REM','#ec8c8c'],['awake','Awake','#c9ced6']];
+  const opts = baseOptions();
+  opts.plugins.tooltip.callbacks = { title: it => fmtDay(days[it[0].dataIndex]) };
+  if (isDesktop()) {
+    opts.onHover = (ev, els) => { ev.native.target.style.cursor = els && els.length ? 'pointer' : 'default'; };
+  }
+  opts.onClick = (ev, els, ch) => {
+    if (suppressBlowClick) { suppressBlowClick = false; return; }
+    if (!els || !els.length) return;
+    const d = days[els[0].index];
+    if (d) openSleepBlow(cv, d, false);
+  };
+  cv.__blowRetarget = (di, idx) => { const d = days[idx]; if (d) openSleepBlow(cv, d, false); };
+  opts.scales.x = { stacked: true, grid: { display: false }, border: { color: THEME.axis },
+    ticks: Object.assign(tickCfg(), { maxTicksLimit: 7, maxRotation: 0, callback: (v, i) => fmtDay(days[i]) }) };
+  opts.scales.y = { stacked: true, grid: gridY(), border: { display: false },
+    title: { display: true, text: 'hours', color: THEME.tick, font: { size: 10, family: THEME.font } },
+    ticks: tickCfg() };
+  const ds = stages.map(([k, name, color]) => ({ label: name, stack: 's', backgroundColor: color, borderWidth: 0,
+    data: shape(days.map(d => { const s = by.get(d); return s && s[k] != null ? s[k] / 60 : null; })) }));
+  const hchart = HSVG.create(cv, { type: 'bar', data: { labels: days, datasets: ds }, options: opts });
+  cv.__svgChart = hchart;
+  charts.push(hchart);
+  const leg = document.createElement('div'); leg.className = 'legend'; el.appendChild(leg);
+  drawLegend(leg, stages.map(([k, name, color]) => ({ label: name, color })));
+}
+
+function buildWorkouts(el, days) {
+  const inR = DATA.workouts.filter(w => days.includes(w.day));
+  const wrap = document.createElement('div'); wrap.className = 'wrap'; el.appendChild(wrap);
+  if (!inR.length) { wrap.innerHTML = '<div class="empty">no workouts in this range</div>'; return; }
+  wrap.style.position = 'relative';
+  const cv = document.createElement('div'); cv.className = 'svghost'; cv.style.height = '100%'; wrap.appendChild(cv);
+  const mins = new Map(), kcal = new Map();
+  inR.forEach(w => {
+    mins.set(w.day, (mins.get(w.day) || 0) + (w.duration_min || 0));
+    kcal.set(w.day, (kcal.get(w.day) || 0) + (w.energy_kcal || 0));
+  });
+  const opts = baseOptions();
+  opts.plugins.tooltip.callbacks = { title: it => fmtDay(days[it[0].dataIndex]) };
+  opts.scales.x = { grid: { display: false }, border: { color: THEME.axis },
+    ticks: Object.assign(tickCfg(), { maxTicksLimit: 7, maxRotation: 0, callback: (v, i) => fmtDay(days[i]) }) };
+  opts.scales.y = { position: 'left', grid: gridY(), border: { display: false },
+    title: { display: true, text: 'min', color: THEME.tick, font: { size: 10, family: THEME.font } }, ticks: tickCfg() };
+  opts.scales.y1 = { position: 'right', grid: { display: false }, border: { display: false },
+    title: { display: true, text: 'kcal', color: THEME.tick, font: { size: 10, family: THEME.font } }, ticks: tickCfg() };
+  const ds = [
+    { type: 'bar', label: 'Minutes', yAxisID: 'y', backgroundColor: '#63bd93', borderWidth: 0,
+      data: shape(days.map(d => mins.has(d) ? mins.get(d) : null)) },
+    (function () {
+      const kv = shape(days.map(d => kcal.has(d) ? kcal.get(d) : null));
+      return { type: 'line', label: 'Energy (kcal)', yAxisID: 'y1', borderColor: '#f0a468', backgroundColor: '#f0a468',
+        borderWidth: 2, pointRadius: dotR(kv), pointHoverRadius: 4, tension: 0.25, spanGaps: true, data: kv };
+    })()
+  ];
+  const hchart = HSVG.create(cv, { type: 'bar', data: { labels: days, datasets: ds }, options: opts, plugins: [chartBox] });
+  cv.__svgChart = hchart;
+  charts.push(hchart);
+  const leg = document.createElement('div'); leg.className = 'legend'; el.appendChild(leg);
+  drawLegend(leg, [{ label: 'Minutes', color: '#63bd93' }, { label: 'Energy (kcal)', color: '#f0a468' }]);
+  const rows = inR.slice().sort((a, b) => a.day < b.day ? 1 : -1).slice(0, 50).map(w =>
+    '<tr><td>' + fmtDay(w.day) + '</td><td>' + (w.type || '') + '</td><td>' +
+    (w.duration_min != null ? Math.round(w.duration_min) : '') + '</td><td>' +
+    (w.distance_km != null ? w.distance_km.toFixed(2) : '') + '</td><td>' +
+    (w.energy_kcal != null ? Math.round(w.energy_kcal) : '') + '</td><td>' +
+    (w.avg_hr != null ? Math.round(w.avg_hr) : '') + '</td></tr>').join('');
+  el.insertAdjacentHTML('beforeend', '<div class="hscroll"><table><thead><tr><th>day</th><th>type</th>' +
+    '<th>min</th><th>mi</th><th>kcal</th><th>avg hr</th></tr></thead><tbody>' + rows + '</tbody></table></div>');
+}
+
+function render() {
+  const host = document.getElementById('hcards');
+  host.innerHTML = '';
+  charts.splice(0).forEach(c => c.destroy());
+  const days = daysIn();
+  const claimed = new Set(CARDS.flatMap(c => c.series || []));
+  CARDS.forEach(card => {
+    let keys = card.series || [];
+    if (card.kind === 'rest') keys = Object.keys(DATA.series).filter(k => !claimed.has(k)).sort();
+    const el = document.createElement('div');
+    el.className = 'card hcard';
+    el.innerHTML = '<span class="title">' + card.title + '</span>' + (card.note ? '<div class="sub">' + card.note + '</div>' : '');
+    host.appendChild(el);
+    if (card.kind === 'sleep') return buildSleep(el, days);
+    if (card.kind === 'workouts') return buildWorkouts(el, days);
+    const present = keys.filter(k => DATA.series[k]);
+    if (!present.length) {
+      el.insertAdjacentHTML('beforeend', '<div class="wrap"><div class="empty">nothing in Health for this group yet</div></div>');
+      return;
+    }
+    if (!VIS[card.id]) {
+      const dflt = (card.on || []).filter(k => present.includes(k));
+      VIS[card.id] = new Set(dflt.length ? dflt : present.slice(0, 2));
+    }
+    buildLine(el, card, present, days);
+    const leg = document.createElement('div'); leg.className = 'legend'; el.appendChild(leg);
+    const items = present.map(k => ({ label: label(k), color: THEME.pastel[present.indexOf(k) % THEME.pastel.length], off: !VIS[card.id].has(k) }));
+    drawLegend(leg, items, (lbl) => {
+      const k = present.find(x => label(x) === lbl);
+      if (VIS[card.id].has(k)) VIS[card.id].delete(k); else VIS[card.id].add(k);
+      render();
+    });
+  });
+}
+
+function seg(id, values, current, pick) {
+  const host = document.getElementById(id);
+  host.innerHTML = '';
+  values.forEach(v => {
+    const b = document.createElement('button');
+    b.textContent = v; b.className = v === current ? 'on' : '';
+    b.onclick = () => { pick(v); };
+    host.appendChild(b);
+  });
+}
+function toolbars() {
+  seg('range', RANGES.map(r => r[0]), RANGE, v => { RANGE = v; toolbars(); render(); });
+  seg('mode', MODES, MODE, v => { MODE = v; toolbars(); render(); });
+}
+document.fonts.ready.then(() => { charts.forEach(c => c.resize(true)); });
+document.getElementById('hsub').textContent = DATA.days.length
+  ? DATA.days[0] + ' \\u2192 ' + DATA.days[DATA.days.length - 1] + ' \\u00b7 ' +
+    Object.keys(DATA.series).length + ' metrics \\u00b7 ' + DATA.workouts.length + ' workouts'
+  : 'no health data loaded yet';
+toolbars();
+render();
+`;
+function happVer() {
+  let h = 5381;
+  for (let i = 0; i < HAPP_JS.length; i++) h = ((h << 5) + h + HAPP_JS.charCodeAt(i)) >>> 0;
+  return h.toString(36);
+}
+const HAPP_VER = happVer();
+
+function healthPage(snap, token, ek) {
+  const payload = JSON.stringify({
+    snap,
+    cards: HEALTH_CARDS,
+    labels: HEALTH_LABELS,
+  }).replace(/</g, "\\u003c");
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>health</title>
+<link rel="preconnect" href="https://app.notion.com" crossorigin><link rel="dns-prefetch" href="https://app.notion.com">
+<style>${CSS}
+  .hcards { display:grid; gap:22px; grid-template-columns:repeat(auto-fit,minmax(430px,1fr)); }
+  .hcard { display:flex; flex-direction:column; }
+  .hcard + .hcard { margin-top:0; padding-top:0; border-top:0; }
+  .hcard .wrap { height:250px; max-height:250px; }
+  .svghost { min-width:0; width:100%; }
+  /* A card with nothing in it yet shouldn't hold open 250px of blank space. */
+  .hcard .wrap:has(.empty) { height:auto; min-height:0; max-height:none; }
+  .hcard .empty { position:static; font-size:12px; color:#9a9a9a; padding:8px 0 2px; }
+  .hcard .sub { font-size:11.5px; color:#797979; margin:2px 0 8px; }
+  .hcard table { width:100%; border-collapse:collapse; font-size:12px; margin-top:10px; }
+  .hcard th, .hcard td { text-align:left; padding:5px 6px; border-bottom:1px solid #f0f0f0; white-space:nowrap; }
+  .hcard th { color:#797979; font-weight:500; }
+  .hscroll { max-height:190px; overflow:auto; }
+  @media (max-width: 900px) { .hcards { grid-template-columns:1fr; } }
+</style>
+</head>
+<body>
+<div class="head">
+  <span class="title">health</span>
+  <span class="seg" id="range"></span>
+  <span class="seg" id="mode"></span>
+</div>
+<div class="sub" id="hsub" style="font-size:11.5px;color:#797979;margin:6px 0 16px"></div>
+<div class="hcards" id="hcards"></div>
+<script id="hpayload" type="application/json">${payload}</script>
+<script>
+window.__HG = ${JSON.stringify(token || "")};
+const P = JSON.parse(document.getElementById('hpayload').textContent);
+</script>
+<script src="/health-app.js?v=${HAPP_VER}"></script>
+</body></html>`;
+}
+
+
 const jsonHeaders = { "content-type": "application/json", "cache-control": "no-store" };
 
 export default {
@@ -5370,6 +9599,10 @@ export default {
         headers: { "content-type": "application/javascript; charset=utf-8", "cache-control": "public, max-age=31536000, immutable" },
       });
     };
+    if (url.pathname === "/health-app.js") {
+      return strictJs(HAPP_JS, HAPP_VER);
+    }
+
     if (url.pathname === "/app.js") {
       return strictJs(APP_JS, APP_VER);
     }
@@ -5387,6 +9620,150 @@ export default {
       });
     }
 
+
+
+
+    // --- Apple Health ingest. Above the gate on purpose: an iOS Shortcut can
+    // send a header but cannot hold the device cookie. Same pattern as the
+    // Notion webhook above, a shared secret checked before any work happens.
+    if (url.pathname.startsWith("/health/") && (req.method === "POST") &&
+        (url.pathname === "/health/ingest" || url.pathname === "/health/seed")) {
+      const key = req.headers.get("X-Health-Key") || "";
+      // TEMPORARY (2026-08-13): the phone side cannot tell us whether a run
+      // reached the worker at all. This records that a request arrived, when,
+      // and the shape of it - never the key or any part of it. Remove once the
+      // shortcut is confirmed working.
+      const seenHeaders = [];
+      for (const [hn] of req.headers) seenHeaders.push(hn);
+      const authed = !!env.HEALTH_INGEST_KEY && safeEqual(key, env.HEALTH_INGEST_KEY);
+      ctx.waitUntil(logIngestAttempt(env, {
+        at: new Date().toISOString(),
+        path: url.pathname,
+        outcome: authed ? "key_ok" : (key ? "key_wrong" : "key_absent"),
+        key_header_present: !!key,
+        key_len: key.length,
+        content_type: req.headers.get("content-type") || "",
+        content_length: req.headers.get("content-length") || "",
+        user_agent: (req.headers.get("user-agent") || "").slice(0, 60),
+        headers: seenHeaders,
+      }));
+      if (!authed) {
+        return new Response("nope", { status: 401, headers: { "cache-control": "no-store" } });
+      }
+      // Shortcuts can send a plain JSON object, or - for the per-sample path -
+      // newline-delimited JSON, one sample object per line. NDJSON avoids having
+      // to build a nested array inside the Shortcuts JSON body editor, which is
+      // the fragile part of that UI.
+      let body = {};
+      {
+        const raw = await req.text();
+        const trimmed = raw.trim();
+        const ctype = (req.headers.get("content-type") || "").toLowerCase();
+        // A single NDJSON line is itself valid JSON, so content type decides:
+        // when the client says ndjson, parse line-wise no matter how many lines
+        // there are. Without this a one-sample post parses as a daily-fields
+        // object, matches no known field, and writes nothing.
+        const ndjson = ctype.includes("ndjson") || ctype.includes("jsonl");
+        if (!trimmed) {
+          // An empty body used to answer ok with nothing written, which reads as
+          // success on the phone. A run that gathered no samples is a failure
+          // worth seeing, so it says so.
+          return new Response(JSON.stringify({
+            ok: false,
+            error: "empty body - the run gathered no samples, so nothing was sent",
+            written: 0,
+          }), { status: 400, headers: jsonHeaders });
+        } else if (ndjson) {
+          const samples = [], daily = [], workouts = [], bad = [];
+          for (const line of trimmed.split(/\r?\n/)) {
+            const t = line.trim().replace(/,$/, "");
+            if (!t) continue;
+            let o;
+            try { o = JSON.parse(t); } catch (e2) { bad.push(t.slice(0, 120)); continue; }
+            // A line with a timestamp is one reading; a line without one is that
+            // metric's figure for the day.
+            if (o && o.workout) workouts.push(o);
+            else if (o && o.ts !== undefined && o.ts !== "") samples.push(o);
+            else if (o && o.metric) daily.push(o);
+            else bad.push(t.slice(0, 120));
+          }
+          if (!samples.length && !daily.length && !workouts.length) {
+            return new Response(JSON.stringify({ ok: false, error: "no parsable NDJSON lines", bad_lines: bad.slice(0, 3) }),
+              { status: 400, headers: jsonHeaders });
+          }
+          body = { samples, daily, workouts: workouts.map(shortcutWorkout).filter(Boolean), __bad_lines: bad.length };
+        } else if (trimmed.startsWith("{") && trimmed.indexOf("\n") === -1) {
+          try { body = JSON.parse(trimmed); } catch (e) {
+            return new Response(JSON.stringify({ error: "body must be JSON" }), { status: 400, headers: jsonHeaders });
+          }
+        } else {
+          try {
+            body = JSON.parse(trimmed);
+          } catch (e) {
+            const samples = [];
+            const bad = [];
+            for (const line of trimmed.split(/\r?\n/)) {
+              const t = line.trim().replace(/,$/, "");
+              if (!t) continue;
+              try { samples.push(JSON.parse(t)); } catch (e2) { bad.push(t.slice(0, 120)); }
+            }
+            if (!samples.length) {
+              return new Response(JSON.stringify({ error: "body must be JSON or NDJSON", bad_lines: bad.slice(0, 3) }),
+                { status: 400, headers: jsonHeaders });
+            }
+            body = { samples, __bad_lines: bad.length };
+          }
+        }
+      }
+      try {
+        await healthInit(env);
+        // A bare sample object (metric + ts + value) posted as plain JSON is a
+        // sample, not a set of daily fields.
+        if (body && body.metric && body.ts !== undefined && !Array.isArray(body.samples)) {
+          body = { samples: [body] };
+        }
+        const out = url.pathname === "/health/seed"
+          ? await healthIngestBulk(env, body)
+          : await healthIngestShortcut(env, body);
+        const touched = body.__touched || [];
+        // The write answers immediately; sample-day reconciliation and the
+        // snapshot the page reads both run behind the response.
+        ctx.waitUntil((async () => {
+          try { await reconcileSampleDays(env, touched); } catch (e) {}
+          try { await refreshHealthSnapshot(env); } catch (e) {}
+          // New health data invalidates the prerendered /health page snapshot,
+          // so the next view renders the fresh ingest instead of a cached page.
+          try { await env.CHART_KV.delete(HPAGE_KEY); HPAGE = null; HPAGE_AT = 0; } catch (e) {}
+        })());
+        if (body.__bad_lines) out.bad_lines = body.__bad_lines;
+        return new Response(JSON.stringify(Object.assign({ ok: true }, out)), { headers: jsonHeaders });
+      } catch (e) {
+        return new Response(JSON.stringify({ ok: false, error: String(e) }), { status: 500, headers: jsonHeaders });
+      }
+    }
+
+    // Ops cleanup (2026-08-27): delete one metric from the health tables.
+    // Same X-Health-Key gate as ingest. Added after an ingest self-test row
+    // needed removing and the deploy token turned out to have no D1-write
+    // permission over the REST API - the worker binding is the only writer.
+    if (req.method === "POST" && url.pathname === "/health/admin/delete-metric") {
+      const key = req.headers.get("X-Health-Key") || "";
+      if (!env.HEALTH_INGEST_KEY || !safeEqual(key, env.HEALTH_INGEST_KEY)) {
+        return new Response("nope", { status: 401, headers: { "cache-control": "no-store" } });
+      }
+      let b = {};
+      try { b = await req.json(); } catch (e) {}
+      const metric = String(b.metric || "");
+      if (!metric) return new Response(JSON.stringify({ ok: false, error: "metric required" }), { status: 400, headers: jsonHeaders });
+      await healthInit(env);
+      const r1 = await env.HEALTH_DB.prepare("DELETE FROM metric_daily WHERE metric = ?").bind(metric).run();
+      const r2 = await env.HEALTH_DB.prepare("DELETE FROM hsample WHERE metric = ?").bind(metric).run();
+      ctx.waitUntil((async () => {
+        try { await refreshHealthSnapshot(env); } catch (e) {}
+        try { await env.CHART_KV.delete(HPAGE_KEY); HPAGE = null; HPAGE_AT = 0; } catch (e) {}
+      })());
+      return new Response(JSON.stringify({ ok: true, metric, metric_daily: r1.meta ? r1.meta.changes : null, hsample: r2.meta ? r2.meta.changes : null }), { headers: jsonHeaders });
+    }
 
     // Owner 8/17 perf: browsers fetch /favicon.ico on every page view; without
     // this route it burned a full gated page render (133KB) as the answer.
@@ -5430,6 +9807,7 @@ export default {
        read used to serialize (~2 KV round trips before first byte). Start the
        snapshot read speculatively - it is only served after auth passes. */
     const pageSnapP = (kParam && !MEM.page) ? env.CHART_KV.get(PAGE_KEY).catch(() => null) : null;
+    const hpageSnapP = (kParam && !HPAGE && (url.pathname === "/health" || url.pathname === "/health/")) ? env.CHART_KV.get(HPAGE_KEY).catch(() => null) : null;
     const ekLive = kParam && safeEqual(kParam, await embedToken(env)) ? kParam : "";
     const ok = await authed(req, env, url);
     if (!ok) return new Response(loginPage(""), { status: 401, headers: htmlHeaders });
@@ -5437,25 +9815,86 @@ export default {
     // Owner 8/17 perf: edge-cached embed pages. Hit = serve instantly + refresh
     // behind; miss = build, store a 60s cacheable copy, serve the normal
     // no-store response. Skipped for the "_" verification bypass.
-    if (ekLive && req.method === "GET" && (url.pathname === "/") && !url.searchParams.has("_")) {
+    if (ekLive && req.method === "GET" && (url.pathname === "/" || url.pathname === "/health") && !url.searchParams.has("_")) {
       const ck = edgePageKey(url.origin, url.pathname, kParam);
       const hit = await caches.default.match(ck);
       if (hit) {
         bg(ctx, "edge-revalidate", async () => {
           try {
-            const html = await getPageHtml(env, ctx, ekLive);
+            const html = url.pathname === "/health" ? await getHealthPageHtml(env, ctx, ekLive) : await getPageHtml(env, ctx, ekLive);
             await caches.default.put(ck, new Response(html, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "public, max-age=60" } }));
           } catch (e) {}
         });
         return hit;
       }
-      const html = await getPageHtml(env, ctx, ekLive, pageSnapP);
+      const html = url.pathname === "/health" ? await getHealthPageHtml(env, ctx, ekLive, hpageSnapP) : await getPageHtml(env, ctx, ekLive, pageSnapP);
       ctx.waitUntil(caches.default.put(ck, new Response(html, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "public, max-age=60" } })).catch(() => {}));
       return new Response(html, {
         headers: withCookies(Object.assign({}, htmlHeaders, { "cache-control": "no-store, no-cache, must-revalidate" }), await deviceCookies(env)),
       });
     }
 
+
+    if (url.pathname === "/health" || url.pathname === "/health/") {
+      try {
+        const html = await getHealthPageHtml(env, ctx, ekLive);
+        return new Response(html, {
+          headers: withCookies(Object.assign({}, htmlHeaders, { "cache-control": "no-store, no-cache, must-revalidate" }), await deviceCookies(env)),
+        });
+      } catch (e) {
+        return new Response(`<!doctype html><body style="font:14px Inter,sans-serif"><p class="err">health error: ${String(e)}</p>`, {
+          status: 502, headers: htmlHeaders,
+        });
+      }
+    }
+
+    if (url.pathname === "/health/data.json") {
+      try {
+        const { snap, source } = await getHealthSnapshot(env, ctx);
+        return new Response(JSON.stringify({ snap: healthDisplay(snap), source }), { headers: jsonHeaders });
+      } catch (e) {
+        return new Response(JSON.stringify({ error: String(e) }), { status: 502, headers: jsonHeaders });
+      }
+    }
+
+    if (url.pathname === "/health/samples.json") {
+      // Raw sample points for one metric, for a future intra-day view. Bounded
+      // so it can never scan the whole table on a single request.
+      try {
+        await healthInit(env);
+        const metric = url.searchParams.get("metric");
+        if (!metric) return new Response(JSON.stringify({ error: "metric required" }), { status: 400, headers: jsonHeaders });
+        const since = url.searchParams.get("since");
+        const lim = Math.min(20000, Math.max(1, Number(url.searchParams.get("limit")) || 5000));
+        const rows = since
+          ? await env.HEALTH_DB.prepare("SELECT ts, end_ts, value, unit, src FROM hsample WHERE metric=?1 AND day>=?2 ORDER BY ts DESC LIMIT ?3").bind(metric, since, lim).all()
+          : await env.HEALTH_DB.prepare("SELECT ts, end_ts, value, unit, src FROM hsample WHERE metric=?1 ORDER BY ts DESC LIMIT ?2").bind(metric, lim).all();
+        return new Response(JSON.stringify({ metric, points: rows.results || [] }), { headers: jsonHeaders });
+      } catch (e) {
+        return new Response(JSON.stringify({ error: String(e) }), { status: 502, headers: jsonHeaders });
+      }
+    }
+
+    // TEMPORARY diagnostic readout, gated like the rest of /health.
+    if (url.pathname === "/health/attempts") {
+      const raw = await env.CHART_KV.get(INGEST_LOG_KEY);
+      return new Response(raw || JSON.stringify({ attempts: [] }), { headers: jsonHeaders });
+    }
+
+    if (url.pathname === "/health/status") {
+      try {
+        await healthInit(env);
+        const r = await env.HEALTH_DB.prepare(
+          "SELECT COUNT(*) AS rows, COUNT(DISTINCT metric) AS metrics, MIN(day) AS first_day, MAX(day) AS last_day, MAX(updated_at) AS last_write FROM metric_daily"
+        ).first();
+        const sr = await env.HEALTH_DB.prepare(
+          "SELECT COUNT(*) AS sample_rows, COUNT(DISTINCT metric) AS sample_metrics, COUNT(DISTINCT src) AS sample_sources FROM hsample"
+        ).first();
+        return new Response(JSON.stringify(Object.assign({}, r, sr)), { headers: jsonHeaders });
+      } catch (e) {
+        return new Response(JSON.stringify({ error: String(e) }), { status: 502, headers: jsonHeaders });
+      }
+    }
 
     if (url.pathname === "/goals") {
       if (req.method === "POST") {
@@ -5558,5 +9997,6 @@ export default {
       });
     }
   },
+
 };
 

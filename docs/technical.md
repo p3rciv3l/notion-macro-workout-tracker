@@ -16,10 +16,17 @@
   the number there is assist weight). A cell that doesn't parse becomes a
   gap, never a zero. Parse results are written back into per-exercise `(wt)`
   number columns; the free-text cell stays authoritative.
-- JSON feeds the pages poll: `/data.json`, `/workout.json`, plus `/v` (a
-  version string an open page polls to refresh itself) and `/status`.
+- `/health` - the Apple Health dashboard: body composition, activity, heart,
+  sleep by stage, workouts, and the long tail of everything else, imperial
+  units over a rolling window. Data lives in D1 in canonical SI units and is
+  converted at render.
+- JSON feeds the pages poll: `/data.json`, `/workout.json`,
+  `/health/data.json`, `/health/samples.json`, plus `/v` (a version string
+  an open page polls to refresh itself) and `/status` / `/health/status`.
 - `POST /notion-webhook` - Notion fires this on database edits; the worker
   verifies it, 200s, and refreshes its KV cache in the background.
+- `POST /health/ingest` and `POST /health/seed` - the Apple Health write
+  endpoints, authenticated by an `X-Health-Key` header.
 
 ## Access model
 
@@ -35,25 +42,30 @@ re-enters it once. Keep the actual password in your password manager
 ## Repo layout
 
 ```
-worker/worker.js            the worker: the macros + workout chart page
+worker/worker.js            the worker: charts, health pages, ingest endpoints
+worker/schema.sql           the D1 schema (also auto-created on first request)
 worker/wrangler.toml.example  every binding and env var, with paste-me placeholders
 ci/deploy.sh                settings fetch-merge + multipart PUT (no build step)
 ci/smoke.sh                 live feature-preservation smoke; needs SMOKE_BASE + SMOKE_K
-.github/workflows/deploy.yml  Test on every push; Deploy + Smoke on manual dispatch
+.github/workflows/deploy.yml  Test on main; Test -> Deploy -> Smoke on deploy/prod
+shortcut/generate_health.py   legacy generator for iOS Shortcuts that POST Apple Health to /health/ingest
+shortcut/shortcut_lib.py      plist action builders shared by the generator
+parser/hkparse.py           streams the Health app's export.zip into daily-aggregate seed JSON for /health/seed
+parser/test_hkparse.py        parser unit tests
 tests/feature-guard.mjs     static+render checks that key features can't be deleted silently
 tests/PORT_NOTES.md         archaeology notes from a mid-history minification event
+docs/first-run-readout.md   how to read the first real Shortcut run
 FORMATTING.md               THE contract for agents writing rows to the Log database
 ```
 
 ## CI pipeline
 
-Every push runs Test (`node --check worker/worker.js`,
-`tests/feature-guard.mjs`). Deploy runs on manual workflow dispatch:
-`ci/deploy.sh` pulls current worker settings first so bindings survive,
-then multipart PUTs the script as `application/javascript+module`. Smoke
-(`ci/smoke.sh`) follows: it polls the live page for marker strings that
-pin user-facing features - window toggles, the Average view, workout
-blow-up rows/hatching - and fails red on a silent rollback. GitHub Action
-secrets are snapshotted at run creation, so rotate a secret before
-deploying, not mid-run. The owner's production instance deploys from the
-`feature/apple-health` branch, which carries the Apple Health stack.
+Push to `main` runs Test (`node --check worker/worker.js`, parser unit
+tests, and `tests/feature-guard.mjs`). Production changes are pushed to
+`deploy/prod`, which runs Test, Deploy
+(`ci/deploy.sh` - pulls current worker settings first so bindings survive,
+then multipart PUTs the script as `application/javascript+module`), then
+Smoke (`ci/smoke.sh` - polls the live page for marker strings that pin
+user-facing features: window toggles, the Average view, workout blow-up
+rows/hatching). GitHub Action secrets are snapshotted at run creation, so
+rotate a secret before pushing, not mid-run.

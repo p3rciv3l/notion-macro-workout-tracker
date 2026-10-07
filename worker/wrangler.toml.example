@@ -2,7 +2,7 @@
 # The same values must ALSO be set on the deployed worker: the CI deploy
 # script merges existing settings, so add these once via the dashboard or
 # `wrangler secret put` / variables, and they survive every deploy.
-name = "cbum-chart"
+name = "my-health-dashboard"
 main = "worker/worker.js"
 compatibility_date = "2024-11-01"
 
@@ -20,10 +20,19 @@ DAY_PAGES_JSON = '{"2026-08-12": "https://app.notion.com/p/..."}'
 binding = "CHART_KV"
 id = "PASTE_KV_NAMESPACE_ID"   # wrangler kv namespace create CHART_KV
 
+[[d1_databases]]
+binding = "HEALTH_DB"
+database_name = "health"
+database_id = "PASTE_D1_DATABASE_ID"   # wrangler d1 create health
+
 # Secrets (never in this file):
 #   NOTION_TOKEN        Notion internal integration token
 #   GATE_PASSWORD       chart login password - keep it in your password manager
+#   HEALTH_INGEST_KEY   phone's X-Health-Key header value
 #   EMBED_TOKEN         legacy; the live embed capability is the embed_token_v1 KV key
 # Set with:  wrangler secret put <NAME>
+
+# iOS Shortcut generation reads your ingest URL from the environment:
+#   HEALTH_INGEST_ENDPOINT="https://my-health-dashboard.YOU.workers.dev/health/ingest"
 #
 # CI Smoke reads: secret SMOKE_K (current embed ?k= token) + variable SMOKE_BASE (worker URL).

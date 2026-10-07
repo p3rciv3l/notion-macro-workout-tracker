@@ -5,12 +5,13 @@
 The entire app is a single ES module (`worker/worker.js`) that serves HTML
 with the app JS inline. Deploy is a multipart PUT of that file; there is no
 bundler, no npm install on the chart side, and the CI deploy script
-fetch-merges the existing worker settings so a deploy can't silently drop a
-binding. Small surface, fast ship, easy to audit: 490KB you can read.
+fetch-merges the existing worker settings so a push can't silently drop a
+KV/D1 binding. Small surface, fast ship, easy to audit: 490KB you can read.
 
 ## Render-time calculation, thin server state
 
-Notion is the system of record for food and workouts. The chart math - day aggregation, goal targets,
+Notion is the system of record for food and workouts; D1 is the system of
+record for health samples. The chart math - day aggregation, goal targets,
 the projected average at today's empty slot - happens at render/epoll time
 in the browser-embedded app JS with no persistence behind it, so a bad
 assumption never stamps itself onto data. KV holds only caches and small

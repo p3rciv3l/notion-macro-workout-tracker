@@ -22,12 +22,16 @@ single row. This file is the ops half.
 
 ## Operating
 
-- Deploys go through CI: push runs Test; trigger Deploy from the Actions tab
-  and confirm Smoke lands green. Secrets are snapshotted at run creation, so rotate before
+- Deploys go through CI: push to `deploy/prod`, confirm Test -> Deploy -> Smoke all
+  land green. `main` runs tests without deploying. Secrets are snapshotted at run creation, so rotate before
   pushing.
-- After a UI/JS deploy, purge the page cache (`cbum:page:html` in KV) so
-  the next render picks up the new bundle; the data caches refresh
-  themselves via the Notion webhook.
+- After a UI/JS deploy, purge the page cache (`cbum:page:html`,
+  `cbum:health:html` in KV) so the next render picks up the new bundle; the
+  data caches refresh themselves via the Notion webhook.
+- Health ingest visibility: `/health/status` and `/health/attempts` are the
+  probes. A silent phone-side Shortcut produces `key_ok` attempts with zero
+  samples; the fix is phone-side, and `docs/first-run-readout.md` covers the
+  read, not rerun-blind.
 - Never rename Log DB property names; the worker reads them. Conventions
   change at the content level only.
 - Secrets live in the owner's password manager and in Worker secret

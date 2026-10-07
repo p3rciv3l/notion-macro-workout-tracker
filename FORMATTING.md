@@ -97,11 +97,11 @@ No blank macro fields. Calories, protein, carbs, fat, saturated fat, sugar, fibe
 
 Empty is reserved for genuinely unknowable cases, and when you use it, say in Items why. A true zero is not a gap - milk has no fiber, soda has no fat - so write the 0 and say it is a label zero.
 
-The chart now marks any day that still has a blank: that nutrient renders as "1,240+" with an amber "partial - N of M items missing" note and the day title carries a partial badge, so a floor never reads as a total.
+Missing values must be resolved in the data, not hidden by presenting a partial sum as a complete total. The current chart intentionally does not add partial badges or annotations.
 
 ## Rule 14: the Items database is the pantry shelf
 
-The "Items" database on the owner's Notion "meals" page (database id 1160e6eb-7099-41ce-8e11-7268cf67d320) holds one row per individual product - not meals, not combos. Title = specific brand + full product name + serving basis (e.g. "Wildwood Organic High Protein Tofu, Super Firm (per 1/5 block = 91g)"). The eight number fields hold exact per-serving label macros, and the label evidence (label photo, or the supplier email / official product page when no photo exists) is attached in the row's Chart files property.
+The "Items" database on the owner's Notion "meals" page holds one row per individual product - not meals, not combos. Title = specific brand + full product name + serving basis (e.g. "Wildwood Organic High Protein Tofu, Super Firm (per 1/5 block = 91g)"). The eight number fields hold exact per-serving label macros, and the label evidence (label photo, or the supplier email / official product page when no photo exists) is attached in the row's Chart files property.
 
 Generic produce (fruit, vegetables, plain staples with no brand) does not need a label hunt - estimate off a standard reference basis (USDA medium/large unit) and say so; an Items row for it uses that reference. Branded/packaged products always get the exact-label rule. (Owner, 2026-08-26: "you can estimate the apple idk".)
 
@@ -124,3 +124,7 @@ Established per-unit bases; always back into macros from these, never re-derive.
 - Once Again Unsweetened Crunchy Peanut Butter (no salt added): per 2 Tbsp (32g) = 190 kcal, 8g protein, 14g fat (2g sat), 7g carb, 2g fiber, 2g sugar, 0mg sodium (label photo 2026-08-21, same values as the 2026-08-20 row)
 - Siggi's nonfat plain skyr (0%): per 24oz tub basis per label (2026-08-13 row)
 - Straus Family Creamery Organic Cream-Top Whole Milk (large red-cap bottle): per 1 cup (240mL) = 160 kcal, 9g protein, 11g carb, 9g fat (7g sat), 11g sugar, 0g fiber, 75mg sodium (manufacturer label, 2026-08-23). The 2%-equivalent convention (used briefly on 2026-08-22 to avoid double-counting a separately logged cream cap) is RETIRED: the cap's cream comes off the whole bottle, so only the pour's own share overlaps - roughly 30 cal on a half-gallon bottle. Log the pour at the whole-milk label and the cap as its own row; one basis beats two conventions, and erring slightly high on cream is the safe direction.
+
+## Rule 15: named products keep their product name; known ingredient lists get broken out
+
+When an item has an actual product name, the row title is the product name + maker + amount - "The Workout Smoothie (Earthbar, half)", never the point of sale ("Equinox"). Rule 5's venue-prefix form is for a venue's own dishes, not branded/named products. When the ingredient list is known (published by the vendor or on a label), break it out into one row per ingredient (owner 2026-09-03: "ideally have broken out ingredients since you had them"): estimate each ingredient, reconcile so the rows sum exactly to the vendor's published totals for the portion eaten, and write the reconciliation in Items. The single blended row is the fallback only when the ingredient list is unknown.
