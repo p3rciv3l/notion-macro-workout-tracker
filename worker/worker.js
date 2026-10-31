@@ -5983,7 +5983,10 @@ function sleepUpsert(env, s) {
 
 function workoutUpsert(env, w) {
   // start+type is stable across re-posts of the same session, so replays are free.
-  const id = w.id || `${w.start || w.day}|${w.type || "?"}`;
+  // An explicit id always wins. Without one, a parseable start is normalized to
+  // the ISO-UTC form the Shortcut path writes, so one session never gets two ids.
+  const sMs = w.id || !w.start ? NaN : parseSampleTs(w.start);
+  const id = w.id || `${Number.isFinite(sMs) && tsSane(sMs) ? new Date(sMs).toISOString() : (w.start || w.day)}|${w.type || "?"}`;
   return env.HEALTH_DB.prepare(
     `INSERT INTO workouts (id, day, type, duration_min, distance_km, energy_kcal, avg_hr, source)
      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)

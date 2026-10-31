@@ -24,6 +24,8 @@ check('Bulk health ingest rejects non-array metrics/sleep instead of silently wr
 
 check('Sleep overlap: one source per night, never summed across sources (external report 10/31; worker + export parser)', /function pickSleepSource/.test(src) && /map\(pickSleepSource\)/.test(src), 'sleep source-selection missing from the shortcut ingest');
 
+check('Workout id: explicit id preserved, otherwise start normalized to ISO-UTC so export and Shortcut paths agree (external report 10/31; no legacy-format rows existed when shipped)', /const sMs = w\.id \|\| !w\.start \? NaN : parseSampleTs\(w\.start\)/.test(src) && /const id = w\.id \|\| `\$\{Number\.isFinite\(sMs\)/.test(src), 'workoutUpsert id normalization missing');
+
 check('No Fitbit/Google Health bridge anywhere (Owner 9/10: "there\'s no fitbit ever" - weight arrives only via Wyze/Apple Health ingest or manual text-ins; bridge code, OAuth routes, and the cron handler must stay gone)', !/ghealth|fitbit/i.test(src), 'Fitbit/Google Health bridge reference reappeared in worker source');
 
 check('Average modifier button (Macros seg)', /data-avg="1">Average</.test(pageTpl), 'data-avg="1">Average button missing from page template');
