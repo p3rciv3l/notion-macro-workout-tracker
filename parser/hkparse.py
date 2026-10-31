@@ -209,11 +209,23 @@ def sleep_night(dt) -> str:
     return d.isoformat()
 
 
+def pick_sleep_source(by_source):
+    """One source per night: overlapping sources (Watch stages plus an iPhone or
+    ring block) must not add up. Prefer the source that reports stages, then the
+    one with the most asleep minutes. A single source passes through unchanged."""
+    def staged(st):
+        return any(k in st for k in ("deep", "rem", "core"))
+    def total(st):
+        return sum(st.get(k, 0.0) for k in ("core", "deep", "rem", "asleep_unspecified"))
+    best = max(by_source.values(), key=lambda st: (staged(st), total(st)))
+    return dict(best)
+
+
 def parse_stream(fh, progress=None):
     """Parse an export.xml stream. Returns a dict of aggregates."""
     daily = defaultdict(lambda: defaultdict(Agg))       # metric -> day -> Agg
     kinds = {}                                          # metric -> "sum"|"disc"
-    sleep = defaultdict(lambda: defaultdict(float))     # night -> stage -> minutes
+    sleep_src = defaultdict(lambda: defaultdict(lambda: defaultdict(float)))  # night -> source -> stage -> minutes
     sleep_window = {}                                   # night -> [start, end]
     workouts = []
     seen = set()                                        # dedupe keys
@@ -256,7 +268,7 @@ def parse_stream(fh, progress=None):
                         seen.add(key)
                         night = sleep_night(sdt)
                         mins = max(0.0, (edt - sdt).total_seconds() / 60.0)
-                        sleep[night][stage] += mins
+                        sleep_src[night][src][stage] += mins
                         w = sleep_window.setdefault(night, [sdt, edt])
                         if stage != "in_bed":
                             if sdt < w[0]:
@@ -369,7 +381,7 @@ def parse_stream(fh, progress=None):
         "daily": {m: {d: a.as_row(kinds.get(m, "disc")) for d, a in days.items()}
                   for m, days in daily.items()},
         "kinds": kinds,
-        "sleep": {night: dict(stages) for night, stages in sleep.items()},
+        "sleep": {night: pick_sleep_source(by_src) for night, by_src in sleep_src.items()},
         "sleep_window": {n_: [w[0].isoformat(), w[1].isoformat()] for n_, w in sleep_window.items()},
         "workouts": workouts,
         "catalog": {m: {"records": c, "sources": sorted(sources[m])} for m, c in counts.items()},

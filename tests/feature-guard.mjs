@@ -19,8 +19,10 @@ const check = (feature, ok, detail = '') => {
 };
 
 console.log('== static feature markers ==');
-check('Notion webhook handshake cannot overwrite an existing HMAC secret (external report 10/31: unauthenticated verification_token POST replaced the secret, letting anyone forge webhooks)', /if \(!secret\) await env\.CHART_KV\.put\(VERIF_KEY, body\.verification_token\)/.test(src) && !/if \(body\.verification_token\) \{\n\s*await env\.CHART_KV\.put/.test(src), 'verification_token can overwrite the stored secret again');
+check('Notion webhook handshake cannot overwrite an existing HMAC secret (external report 10/31: unauthenticated verification_token POST replaced the secret, letting anyone forge webhooks)', /if \(!secret \|\| isAdmin\) await env\.CHART_KV\.put\(VERIF_KEY, body\.verification_token\)/.test(src) && /return new Response\("not verified", \{ status: 401 \}\)/.test(src) && !/if \(body\.verification_token\) \{\n\s*await env\.CHART_KV\.put/.test(src), 'verification_token can overwrite the stored secret again');
 check('Bulk health ingest rejects non-array metrics/sleep instead of silently writing zero rows (external report 10/31)', /must be an array of flat rows/.test(src), 'array-shape guard missing from healthIngestBulk');
+
+check('Sleep overlap: one source per night, never summed across sources (external report 10/31; worker + export parser)', /function pickSleepSource/.test(src) && /map\(pickSleepSource\)/.test(src), 'sleep source-selection missing from the shortcut ingest');
 
 check('No Fitbit/Google Health bridge anywhere (Owner 9/10: "there\'s no fitbit ever" - weight arrives only via Wyze/Apple Health ingest or manual text-ins; bridge code, OAuth routes, and the cron handler must stay gone)', !/ghealth|fitbit/i.test(src), 'Fitbit/Google Health bridge reference reappeared in worker source');
 

@@ -130,6 +130,17 @@ class TestSleep(unittest.TestCase):
         self.assertAlmostEqual(res["sleep"]["2026-07-19"]["core"], 180.0)
         self.assertEqual(res["duplicates_skipped"], 1)
 
+    def test_overlapping_sources_not_summed(self):
+        rec = lambda src, v, sd, ed: ('<Record type="HKCategoryTypeIdentifierSleepAnalysis" '
+                                      f'sourceName="{src}" startDate="{sd}" endDate="{ed}" value="{v}"/>')
+        body = (rec("Watch", "HKCategoryValueSleepAnalysisAsleepCore", "2026-07-18 23:00:00 -0700", "2026-07-19 02:00:00 -0700")
+                + rec("Watch", "HKCategoryValueSleepAnalysisAsleepDeep", "2026-07-19 02:00:00 -0700", "2026-07-19 03:00:00 -0700")
+                + rec("iPhone", "HKCategoryValueSleepAnalysisAsleepUnspecified", "2026-07-18 23:05:00 -0700", "2026-07-19 03:05:00 -0700"))
+        n = parse_stream(xml(body))["sleep"]["2026-07-19"]
+        self.assertAlmostEqual(n["core"], 180.0)
+        self.assertAlmostEqual(n["deep"], 60.0)
+        self.assertNotIn("asleep_unspecified", n)
+
 class TestWorkouts(unittest.TestCase):
     def test_modern_workout_statistics(self):
         body = ('<Workout workoutActivityType="HKWorkoutActivityTypeRunning" duration="32.5" '

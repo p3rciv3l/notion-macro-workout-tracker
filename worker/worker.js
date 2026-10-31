@@ -6215,7 +6215,12 @@ async function healthIngestShortcut(env, body) {
         // A night is credited to the day it ends on, which is the morning Owner
         // wakes up in.
         const sd = new Date(b).toLocaleDateString("en-CA", { timeZone: HEALTH_TZ });
-        const acc = sleepAcc[sd] || (sleepAcc[sd] = { day: sd });
+        // Tracked per source: two sources writing the same night (Watch stages
+        // plus an iPhone or ring block) overlap, so one source is picked per
+        // night below instead of adding them together.
+        const night = sleepAcc[sd] || (sleepAcc[sd] = {});
+        const acc = night[s.source || ""] || (night[s.source || ""] = { day: sd, staged: false });
+        if (/deep|rem|core/.test(stage)) acc.staged = true;
         acc[bucket] = (acc[bucket] || 0) + mins;
         continue;
       }
@@ -6273,7 +6278,7 @@ async function healthIngestShortcut(env, body) {
         cnt: c.n, src: "shortcut",
       }));
     }
-    for (const acc of Object.values(sleepAcc)) {
+    for (const acc of Object.values(sleepAcc).map(pickSleepSource)) {
       stmts.push(sleepUpsert(env, {
         day: acc.day, core: acc.core ?? null, deep: acc.deep ?? null, rem: acc.rem ?? null,
         awake: acc.awake ?? null, in_bed: acc.in_bed ?? null,
@@ -6307,6 +6312,15 @@ async function healthIngestShortcut(env, body) {
   // rows, so this goes up in chunks rather than as one oversized batch.
   for (let i = 0; i < stmts.length; i += 100) await env.HEALTH_DB.batch(stmts.slice(i, i + 100));
   return { day, written: stmts.length, metrics: [...new Set(wrote)], ...diag };
+}
+
+// One source per night: prefer the source that reports stages (deep/rem/core),
+// then the one with the most minutes. A single source passes through unchanged.
+function pickSleepSource(bySource) {
+  const all = Object.values(bySource);
+  const total = a => (a.core || 0) + (a.deep || 0) + (a.rem || 0);
+  all.sort((a, b) => (b.staged - a.staged) || (total(b) - total(a)));
+  return all[0];
 }
 
 // Bulk path for the export.zip backfill: same tables, same upserts, batched.
@@ -9568,11 +9582,18 @@ export default {
       if (body.verification_token) {
         // The handshake is unsigned, so it may only SET the secret once. After
         // that an unauthenticated POST must not replace it (forgery hole).
-        if (!secret) await env.CHART_KV.put(VERIF_KEY, body.verification_token);
+        // Replacing an existing secret (a recreated subscription) needs the
+        // admin ingest key, so it is deliberate and never anonymous.
+        const adminKey = req.headers.get("X-Health-Key") || "";
+        const isAdmin = !!env.HEALTH_INGEST_KEY && safeEqual(adminKey, env.HEALTH_INGEST_KEY);
+        if (!secret || isAdmin) await env.CHART_KV.put(VERIF_KEY, body.verification_token);
         return new Response("ok", { status: 200 });
       }
+      // Fail closed: with no secret stored yet nothing can be verified, so
+      // events are refused until the one-time handshake has run.
+      if (!secret) return new Response("not verified", { status: 401 });
       const sigHeader = req.headers.get("X-Notion-Signature") || "";
-      if (secret) {
+      {
         const expected = "sha256=" + (await hmacHex(secret, bodyText));
         if (!safeEqual(sigHeader, expected)) return new Response("bad signature", { status: 401 });
       }
