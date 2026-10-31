@@ -6222,6 +6222,7 @@ async function healthIngestShortcut(env, body) {
         const acc = night[s.source || ""] || (night[s.source || ""] = { day: sd, staged: false });
         if (/deep|rem|core/.test(stage)) acc.staged = true;
         acc[bucket] = (acc[bucket] || 0) + mins;
+        (acc.segs || (acc.segs = [])).push([a, b, bucket]);
         continue;
       }
       const raw = numOrNull(s.value);
@@ -6314,13 +6315,29 @@ async function healthIngestShortcut(env, body) {
   return { day, written: stmts.length, metrics: [...new Set(wrote)], ...diag };
 }
 
-// One source per night: prefer the source that reports stages (deep/rem/core),
-// then the one with the most minutes. A single source passes through unchanged.
+// One source per night. The primary source is the one that reports stages
+// (deep/rem/core), then the one with the most minutes; its totals are kept as
+// is. Segments from other sources are added only where they do not overlap any
+// primary-source segment in time, so a ring or iPhone block that covers time
+// the Watch missed still counts but overlapping blocks never stack. A single
+// source passes through unchanged.
 function pickSleepSource(bySource) {
   const all = Object.values(bySource);
   const total = a => (a.core || 0) + (a.deep || 0) + (a.rem || 0);
   all.sort((a, b) => (b.staged - a.staged) || (total(b) - total(a)));
-  return all[0];
+  const out = { day: all[0].day };
+  const kept = [];
+  const take = (seg) => { out[seg[2]] = (out[seg[2]] || 0) + (seg[1] - seg[0]) / 60000; kept.push(seg); };
+  for (const seg of all[0].segs || []) take(seg);
+  const hasInBed = (out.in_bed || 0) > 0;
+  for (const other of all.slice(1)) {
+    for (const seg of other.segs || []) {
+      if (seg[2] === "in_bed" && hasInBed) continue;
+      if (kept.some(k => k[2] !== "in_bed" && seg[2] !== "in_bed" && seg[0] < k[1] && k[0] < seg[1])) continue;
+      take(seg);
+    }
+  }
+  return out;
 }
 
 // Bulk path for the export.zip backfill: same tables, same upserts, batched.

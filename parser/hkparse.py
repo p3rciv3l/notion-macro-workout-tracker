@@ -209,16 +209,29 @@ def sleep_night(dt) -> str:
     return d.isoformat()
 
 
-def pick_sleep_source(by_source):
-    """One source per night: overlapping sources (Watch stages plus an iPhone or
-    ring block) must not add up. Prefer the source that reports stages, then the
-    one with the most asleep minutes. A single source passes through unchanged."""
+def pick_sleep_source(by_source, segs_by_source):
+    """One source per night. The primary source (stages first, then most asleep
+    minutes) keeps its totals. Segments from other sources count only where they
+    do not overlap a primary segment in time, so overlapping sources never stack
+    while genuinely missing time is still credited. A single source passes
+    through unchanged."""
     def staged(st):
         return any(k in st for k in ("deep", "rem", "core"))
     def total(st):
         return sum(st.get(k, 0.0) for k in ("core", "deep", "rem", "asleep_unspecified"))
-    best = max(by_source.values(), key=lambda st: (staged(st), total(st)))
-    return dict(best)
+    order = sorted(by_source, key=lambda s: (staged(by_source[s]), total(by_source[s])), reverse=True)
+    out = dict(by_source[order[0]])
+    kept = list(segs_by_source[order[0]])
+    has_in_bed = out.get("in_bed", 0.0) > 0
+    for src in order[1:]:
+        for sdt, edt, stage in segs_by_source[src]:
+            if stage == "in_bed" and has_in_bed:
+                continue
+            if stage != "in_bed" and any(k[2] != "in_bed" and sdt < k[1] and k[0] < edt for k in kept):
+                continue
+            out[stage] = out.get(stage, 0.0) + max(0.0, (edt - sdt).total_seconds() / 60.0)
+            kept.append((sdt, edt, stage))
+    return out
 
 
 def parse_stream(fh, progress=None):
@@ -226,6 +239,7 @@ def parse_stream(fh, progress=None):
     daily = defaultdict(lambda: defaultdict(Agg))       # metric -> day -> Agg
     kinds = {}                                          # metric -> "sum"|"disc"
     sleep_src = defaultdict(lambda: defaultdict(lambda: defaultdict(float)))  # night -> source -> stage -> minutes
+    sleep_segs = defaultdict(lambda: defaultdict(list))  # night -> source -> [(start, end, stage)]
     sleep_window = {}                                   # night -> [start, end]
     workouts = []
     seen = set()                                        # dedupe keys
@@ -269,6 +283,7 @@ def parse_stream(fh, progress=None):
                         night = sleep_night(sdt)
                         mins = max(0.0, (edt - sdt).total_seconds() / 60.0)
                         sleep_src[night][src][stage] += mins
+                        sleep_segs[night][src].append((sdt, edt, stage))
                         w = sleep_window.setdefault(night, [sdt, edt])
                         if stage != "in_bed":
                             if sdt < w[0]:
@@ -381,7 +396,7 @@ def parse_stream(fh, progress=None):
         "daily": {m: {d: a.as_row(kinds.get(m, "disc")) for d, a in days.items()}
                   for m, days in daily.items()},
         "kinds": kinds,
-        "sleep": {night: pick_sleep_source(by_src) for night, by_src in sleep_src.items()},
+        "sleep": {night: pick_sleep_source(by_src, sleep_segs[night]) for night, by_src in sleep_src.items()},
         "sleep_window": {n_: [w[0].isoformat(), w[1].isoformat()] for n_, w in sleep_window.items()},
         "workouts": workouts,
         "catalog": {m: {"records": c, "sources": sorted(sources[m])} for m, c in counts.items()},
