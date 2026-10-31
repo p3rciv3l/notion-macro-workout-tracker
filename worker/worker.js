@@ -6316,6 +6316,9 @@ async function healthIngestBulk(env, body) {
   const push = (arr, fn) => {
     for (let i = 0; i < arr.length; i += 100) chunks.push(arr.slice(i, i + 100).map(fn));
   };
+  for (const k of ["metrics", "sleep"]) {
+    if (body[k] !== undefined && !Array.isArray(body[k])) throw Object.assign(new Error(k + " must be an array of flat rows"), { status: 400 });
+  }
   if (Array.isArray(body.metrics)) { push(body.metrics, r => metricUpsert(env, r)); out.metrics = body.metrics.length; }
   if (Array.isArray(body.sleep)) { push(body.sleep, s => sleepUpsert(env, s)); out.sleep = body.sleep.length; }
   if (Array.isArray(body.workouts)) { push(body.workouts, w => workoutUpsert(env, w)); out.workouts = body.workouts.length; }
@@ -9561,11 +9564,13 @@ export default {
       const bodyText = await req.text();
       let body = {};
       try { body = JSON.parse(bodyText); } catch (e) {}
+      const secret = await env.CHART_KV.get(VERIF_KEY);
       if (body.verification_token) {
-        await env.CHART_KV.put(VERIF_KEY, body.verification_token);
+        // The handshake is unsigned, so it may only SET the secret once. After
+        // that an unauthenticated POST must not replace it (forgery hole).
+        if (!secret) await env.CHART_KV.put(VERIF_KEY, body.verification_token);
         return new Response("ok", { status: 200 });
       }
-      const secret = await env.CHART_KV.get(VERIF_KEY);
       const sigHeader = req.headers.get("X-Notion-Signature") || "";
       if (secret) {
         const expected = "sha256=" + (await hmacHex(secret, bodyText));
@@ -9739,7 +9744,7 @@ export default {
         if (body.__bad_lines) out.bad_lines = body.__bad_lines;
         return new Response(JSON.stringify(Object.assign({ ok: true }, out)), { headers: jsonHeaders });
       } catch (e) {
-        return new Response(JSON.stringify({ ok: false, error: String(e) }), { status: 500, headers: jsonHeaders });
+        return new Response(JSON.stringify({ ok: false, error: String(e) }), { status: (e && e.status) || 500, headers: jsonHeaders });
       }
     }
 
