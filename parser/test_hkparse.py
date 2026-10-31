@@ -151,6 +151,24 @@ class TestSleep(unittest.TestCase):
         self.assertAlmostEqual(n["core"], 180.0)
         self.assertAlmostEqual(n["asleep_unspecified"], 60.0)
 
+class TestSeed(unittest.TestCase):
+    def test_seed_is_flat_rows_with_stable_workout_id(self):
+        from hkparse import to_seed
+        body = ('<Record type="HKQuantityTypeIdentifierStepCount" sourceName="iPhone" unit="count" '
+                'startDate="2026-07-18 09:00:00 -0700" endDate="2026-07-18 09:30:00 -0700" value="500"/>'
+                '<Record type="HKCategoryTypeIdentifierSleepAnalysis" sourceName="Watch" '
+                'startDate="2026-07-18 23:00:00 -0700" endDate="2026-07-19 02:00:00 -0700" '
+                'value="HKCategoryValueSleepAnalysisAsleepCore"/>'
+                '<Workout workoutActivityType="HKWorkoutActivityTypeRunning" duration="30" durationUnit="min" '
+                'sourceName="Watch" startDate="2026-07-18 07:14:22 -0700" endDate="2026-07-18 07:44:22 -0700"/>')
+        seed = to_seed(parse_stream(xml(body)))
+        self.assertTrue(all(isinstance(seed[k], list) for k in ("metrics", "sleep", "workouts")))
+        self.assertEqual(seed["metrics"][0]["metric"], "StepCount")
+        self.assertEqual(seed["metrics"][0]["day"], "2026-07-18")
+        self.assertAlmostEqual(seed["sleep"][0]["core"], 180.0)
+        self.assertEqual(seed["workouts"][0]["id"], "2026-07-18T14:14:22.000Z|Running")
+        self.assertEqual(seed["workouts"][0]["start"], "2026-07-18T14:14:22.000Z")
+
 class TestWorkouts(unittest.TestCase):
     def test_modern_workout_statistics(self):
         body = ('<Workout workoutActivityType="HKWorkoutActivityTypeRunning" duration="32.5" '

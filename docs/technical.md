@@ -50,7 +50,7 @@ ci/smoke.sh                 live feature-preservation smoke; needs SMOKE_BASE + 
 .github/workflows/deploy.yml  Test on main; Test -> Deploy -> Smoke on deploy/prod
 shortcut/generate_health.py   legacy generator for iOS Shortcuts that POST Apple Health to /health/ingest
 shortcut/shortcut_lib.py      plist action builders shared by the generator
-parser/hkparse.py           streams the Health app's export.zip into daily-aggregate seed JSON for /health/seed
+parser/hkparse.py           streams the Health app export.zip into seed JSON; add --seed to write the flat rows /health/seed reads
 parser/test_hkparse.py        parser unit tests
 tests/feature-guard.mjs     static+render checks that key features can't be deleted silently
 tests/PORT_NOTES.md         archaeology notes from a mid-history minification event

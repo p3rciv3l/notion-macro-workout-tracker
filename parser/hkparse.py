@@ -17,7 +17,7 @@ import re
 import sys
 import zipfile
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from xml.etree import ElementTree as ET
 
 # ---------------------------------------------------------------- units
@@ -405,6 +405,34 @@ def parse_stream(fh, progress=None):
     }
 
 
+def to_seed(res):
+    """Flatten parse_stream output into the flat-row shape /health/seed reads:
+    metrics rows, sleep rows, workouts with an ISO-UTC start and a stable id
+    (same form the Shortcut path writes, so one session never gets two ids)."""
+    metrics = []
+    for metric, days in res["daily"].items():
+        for day, row in days.items():
+            value = row.get("value", row.get("last"))
+            if value is None:
+                continue
+            metrics.append({"metric": metric, "day": day, "unit": row.get("unit"), "value": value,
+                            "mn": row.get("min"), "mx": row.get("max"), "cnt": row.get("count"),
+                            "src": "export"})
+    sleep = []
+    for night, st in res["sleep"].items():
+        sleep.append({"day": night, "core": (st.get("core", 0.0) + st.get("asleep_unspecified", 0.0)) or None,
+                      "deep": st.get("deep"), "rem": st.get("rem"),
+                      "awake": st.get("awake"), "in_bed": st.get("in_bed")})
+    workouts = []
+    for w in res["workouts"]:
+        dt, _ = parse_dt(w.get("start"))
+        if dt is None:
+            continue
+        iso = dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        workouts.append(dict(w, start=iso, id=iso + "|" + (w.get("type") or "?")))
+    return {"metrics": metrics, "sleep": sleep, "workouts": workouts}
+
+
 def open_export(path):
     if path.endswith(".zip"):
         zf = zipfile.ZipFile(path)
@@ -418,13 +446,15 @@ def open_export(path):
 
 def main():
     if len(sys.argv) < 2:
-        raise SystemExit("usage: hkparse.py <export.zip|export.xml> [out.json]")
-    src = sys.argv[1]
-    out = sys.argv[2] if len(sys.argv) > 2 else "/tmp/health/parsed.json"
+        raise SystemExit("usage: hkparse.py <export.zip|export.xml> [out.json] [--seed]")
+    src = [a for a in sys.argv[1:] if a != "--seed"][0]
+    args = [a for a in sys.argv[1:] if a != "--seed"]
+    seed = "--seed" in sys.argv[1:]
+    out = args[1] if len(args) > 1 else "/tmp/health/parsed.json"
     with open_export(src) as fh:
         res = parse_stream(fh, progress=lambda n: print(f"  {n:,} records", file=sys.stderr))
     with open(out, "w") as f:
-        json.dump(res, f)
+        json.dump(to_seed(res) if seed else res, f)
     print(f"records={res['record_count']:,} dupes={res['duplicates_skipped']:,} "
           f"metrics={len(res['daily'])} workouts={len(res['workouts'])} -> {out}")
 
